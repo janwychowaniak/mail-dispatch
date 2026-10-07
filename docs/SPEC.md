@@ -1,8 +1,9 @@
 # mail-dispatch — functional specification
 
-**Status: DRAFT (2026-10-07), under clarification.** Once approved, this file is the source of
-truth for implementation and the authority on the contract. Design decisions are marked `[D#]`
-inline and recorded in [§13](#13-decision-record); defects are reported against those numbers.
+**Status: DRAFT (2026-10-07), under clarification; the first round of answers is applied.**
+Once approved, this file is the source of truth for implementation and the authority on the
+contract. Design decisions are marked `[D#]` inline and recorded in
+[§13](#13-decision-record); defects are reported against those numbers.
 
 ## 1. Purpose
 
@@ -49,16 +50,23 @@ SMTP conversation, the fidelity of the report); the second belongs to the consum
 | `GET /v1/health` | state of the service and of the SMTP server (§6) |
 
 - Requests and responses are JSON in UTF-8.
-- The `Content-Type: application/json` request header (the parameter `charset=utf-8` is allowed)
-  is checked **before the body is read**. Any other type, invalid JSON, a byte-order mark at the
-  start of the body, or a key repeated within an object (including `headers{}`) is
-  `INVALID_REQUEST`.
+- The `Content-Type: application/json` request header is checked **before the body is read**. The
+  media type and the value of `charset` are compared case-insensitively; the only parameter
+  allowed is `charset=utf-8` (quoted or not, with optional white space around `;`). A missing
+  header, any other type or any other parameter, invalid JSON, a byte-order mark at the start of
+  the body, or a key repeated within an object (including `headers{}`) is `INVALID_REQUEST`.
+- Paths are matched exactly: a query string is ignored, a trailing slash (`/v1/send/`) is
+  `NOT_FOUND`. Each path accepts only its listed method; anything else, `HEAD` included, is
+  `METHOD_NOT_ALLOWED` with an `Allow` header.
 - The response is JSON on error too, **always** — including an unknown path (`NOT_FOUND`, 404), a
   method not allowed (`METHOD_NOT_ALLOWED`, 405) and an unexpected exception (`INTERNAL_ERROR`,
   500). No error leaves the envelope of §5.3.
 - Every request to `/v1/send` gets a random `dispatch_id` that cannot be derived from the content.
   It is returned in the response, in every error envelope and in the logs — it is the only
-  correlation key between a consumer and the service's log.
+  correlation key between a consumer and the service's log. **Every error envelope** carries a
+  fresh `dispatch_id`, whatever the path and method — `NOT_FOUND`, `METHOD_NOT_ALLOWED`, and an
+  `INTERNAL_ERROR` raised while handling health included — so there is one envelope shape. Only a
+  successful health response has none. `[D33]`
 - The `/v1` path is part of the contract (§11).
 
 ## 4. Request: `POST /v1/send`
@@ -82,9 +90,13 @@ SMTP conversation, the fidelity of the report); the second belongs to the consum
 ### 4.1 Shape
 
 - The shape is **strict**: unknown fields and values of the wrong type are `INVALID_REQUEST`.
-- An absent field, `null` and an empty array mean the same thing ("there is none").
+- An absent field, `null` and an empty array mean the same thing ("there is none"); so does an
+  empty `headers` object. A required field given as `null` is therefore missing
+  (`INVALID_REQUEST`).
 - An empty string in `text`, `html` or `subject` means "present, empty".
-- A `name` that is empty or consists of spaces only is treated as absent.
+- A `name` that is empty or consists only of characters with the Unicode `White_Space` property is
+  treated as absent. `[D35]` Any other `name` is used as given: it is not trimmed, and leading and
+  trailing spaces go into the encoding.
 - `inline` without `html` is `INVALID_REQUEST`.
 - Every text field must be valid Unicode that can be encoded in UTF-8 (a lone surrogate is
   `INVALID_REQUEST`).
@@ -97,11 +109,14 @@ An address is **always an object** `{address, name?}`. The service does not pars
 
 `address` must match the RFC 5321 `addr-spec` grammar within ASCII:
 
-- **local part:** a `dot-atom` or a `quoted-string`, no longer than 64 characters;
+- **local part:** a `dot-atom` or a non-empty `quoted-string`, no longer than 64 characters
+  counted as written (quotes and quoting backslashes included); `""` is refused;
 - **domain:** either labels separated by dots — at least two labels; a label is 1–63 characters of
   letters, digits and hyphens, with no hyphen at either end; the last label is not all digits; no
   trailing dot; the domain is no longer than 255 characters — or an address literal in square
-  brackets (a valid IPv4 address, or `IPv6:` followed by a valid IPv6 address);
+  brackets: a valid IPv4 address without leading zeros, or the tag `IPv6:` (case-insensitive)
+  followed by a valid IPv6 address, the forms with an embedded IPv4 address included; a zone
+  identifier (`%eth0`) and a `General-address-literal` are refused;
 - the whole `addr-spec` is no longer than 254 characters.
 
 Non-ASCII addresses (SMTPUTF8, IDN in Unicode form) are rejected in v1 as `INVALID_ADDRESS`:
@@ -111,7 +126,8 @@ supporting them needs negotiation with the server and is outside v1. `[D5]`
 according to RFC 2047 and quotes it where the syntax requires.
 
 **Duplicates** are counted only among the envelope recipients (`to`, `cc` and `bcc` together; the
-local part compared literally, the domain case-insensitively). The same address twice is
+local part compared literally, the domain — an address literal too — case-insensitively, so
+`"a"@example.org` and `a@example.org` are two addresses). The same address twice is
 `INVALID_REQUEST` pointing at the second occurrence: two `RCPT TO` of the same address give a
 server-dependent result, and the per-entry report stops being unambiguous. `[D6]` `from` and
 `reply_to` may coincide with recipients (sending to oneself is legitimate). A duplicate within
@@ -136,30 +152,38 @@ service **does not fabricate** a `To` header. The envelope sender (`MAIL FROM`) 
   read the HTML to check that the reference exists** — every `inline[]` entry is attached as a
   part with `Content-ID: <cid>` and `Content-Disposition: inline`, whether the HTML uses it or
   not. `[D9]` `cid` is a non-empty string of RFC 5322 `atext` characters plus `.` and `@`; a
-  duplicate within one request is `INVALID_CONTENT`. `content_type` is required here, `filename`
-  optional (without it the part has no name parameter). The `multipart/related` part gets the
-  parameter `type="text/html"` (RFC 2387).
+  duplicate within one request (compared case-sensitively) is `INVALID_CONTENT`. `content_type` is
+  required here, `filename` optional (without it the part has no name parameter). The
+  `multipart/related` part gets the parameter `type="text/html"` (RFC 2387).
 - **`attachments[]`** are parts with `Content-Disposition: attachment`. `filename` is required,
   `content_type` optional — when it is absent, the service guesses it from the name's extension
   using a **built-in** table (not the system's tables, because the result must not depend on the
-  host; the table never yields `message/*` or `multipart/*`), and falls back to
-  `application/octet-stream`. `[D10]`
+  host), and falls back to `application/octet-stream`. `[D10]` The table covers a few dozen common
+  extensions; only the last extension counts, compared case-insensitively; no parameter is added to
+  a guessed type (no `charset` for `text/*`). The table never yields `message/*` or `multipart/*`,
+  so `.eml`, `.msg` and `.mht` come out as `application/octet-stream`.
 - **A file name** (in `attachments[]` and `inline[]`) is a value, not a path. Rejected as
-  `INVALID_CONTENT`: `/` and `\`; names that are empty or consist of spaces only; `.` and `..`;
-  names longer than 255 characters. The name goes only into `Content-Disposition` (`filename`,
-  and for non-ASCII or long names `filename*` according to RFC 2231, with continuations where
-  needed).
-- **`content_type`** (where given) has the shape `type/subtype` with optional parameters per
-  RFC 2045, in ASCII. Parameters are copied verbatim, except `boundary`, `name` and `filename`,
-  which the service does not accept because it sets structure and names itself
-  (`INVALID_CONTENT`). `multipart/*` and `message/*` are rejected — the first because structure is
-  the service's business, the second because RFC 2046 does not allow encoding them in `base64`,
-  and the service encodes parts only that way (§4.4); a message as an attachment is sent as
-  `application/octet-stream`. `[D12]` Any other malformed shape is `INVALID_CONTENT`. The `text`
-  and `html` parts get `charset=utf-8` from the service.
+  `INVALID_CONTENT`: a name containing `/` or `\`; a name that is empty or consists only of
+  characters with the Unicode `White_Space` property `[D35]`; a name equal to `.` or `..`; a name
+  longer than 255 characters. A name that merely contains `..` (`report..pdf`) is valid: without a
+  separator it cannot step out of anything. `[D32]` The name goes only into `Content-Disposition`
+  (§4.5, folding).
+- **`content_type`** (where given) has the strict shape `type/subtype` followed by optional
+  `; attribute=value` parameters per RFC 2045, in ASCII, with no comments. Parameters are copied
+  verbatim, except `boundary`, `name` and `filename` — in their RFC 2231 forms too (`name*`,
+  `filename*0*`, …) — which the service does not accept because it sets structure and names itself
+  (`INVALID_CONTENT`). A parameter given twice is `INVALID_CONTENT`. `multipart/*` and `message/*`
+  (compared case-insensitively) are rejected — the first because structure is the service's
+  business, the second because RFC 2046 does not allow encoding them in `base64`, and the service
+  encodes parts only that way (§4.4); a message as an attachment is sent as
+  `application/octet-stream`. `[D12]` Any other malformed shape is `INVALID_CONTENT`. The value is
+  written as `type/subtype; a=b; c="d"`: type, subtype, parameter names and values as given, one
+  `; ` between parameters, and folding allowed only between parameters. The `text` and `html`
+  parts get `charset=utf-8` from the service.
 - **Binary content** arrives as base64: the standard alphabet with padding. `CR`, `LF` and spaces
-  are removed from anywhere before decoding; anything else is `INVALID_CONTENT`. Empty content
-  (a 0-byte file) is allowed.
+  (U+0020) are removed from anywhere before decoding; anything else, a tab included, is
+  `INVALID_CONTENT`. Non-zero padding bits (`QR==`) are accepted. Empty content (a 0-byte file) is
+  allowed.
 
 ### 4.4 MIME structure and transfer encoding
 
@@ -176,14 +200,17 @@ service **does not fabricate** a `To` header. The envelope sender (`MAIL FROM`) 
 **The transfer encoding is a rule, not a heuristic.** `[D11]`
 
 - `text` and `html` go as `quoted-printable` when the number of UTF-8 bytes outside the range
-  32–126 (after line-ending normalisation, not counting `CRLF`) does not exceed one third of all
-  bytes of the content (equality means `quoted-printable`); otherwise as `base64`.
+  32–126 does not exceed one third of all bytes of the content; otherwise as `base64`. Both counts
+  are taken after line-ending normalisation; the numerator does not count `CR` and `LF` (after
+  normalisation they occur only as `CRLF`), the denominator counts every byte, `CR` and `LF`
+  included. Equality means `quoted-printable`, so **empty content is `quoted-printable`**.
 - `inline[]` and `attachments[]` go **always** as `base64`, `text/*` types included.
 - `7bit` and `8bit` are never used, so the message is valid whether or not the server announces
   `8BITMIME`, and the service passes neither `BODY=` nor `SMTPUTF8` in `MAIL FROM`.
 
-The order of parts, their headers and encodings are deterministic for the same request; the only
-variable elements are `Date`, `Message-ID` and the MIME boundaries. `[D13]`
+Multipart bodies have no preamble and no epilogue. The order of parts, their headers and encodings
+are deterministic for the same request; the only variable elements are `Date`, `Message-ID` and
+the MIME boundaries. `[D13]`
 
 ### 4.5 Headers
 
@@ -192,6 +219,9 @@ The service sets the message headers itself, **in a fixed order**: `From`, `To`,
 order, then the structure's `Content-*` headers. `[D13]`
 
 - `Subject` is always present, with an empty value too.
+- The subject and names are encoded per RFC 2047 when they contain anything outside printable
+  ASCII, and also when they are ASCII but contain `=?` — otherwise a recipient would decode that
+  text as an encoded-word, and it would not read back identical.
 - `Date` is an RFC 5322 `date-time` of the moment of composition, in UTC written as `+0000`.
 - `Message-ID` has the form `<random-token@domain>`: the token is random and cannot be derived from
   the content; the domain comes from `MESSAGE_ID_DOMAIN` (validated at startup like an address
@@ -207,18 +237,29 @@ order, then the structure's `Content-*` headers. `[D13]`
   `Content-*` header. Setting any of them, or two keys differing only in letter case, is
   `INVALID_HEADER`. `[D15]`
 - The header name must match RFC 5322 `field-name` (printable ASCII without a colon).
-- The value must be ASCII text, non-empty and not spaces only (encoding non-ASCII values in custom
-  headers is not part of v1).
-- Values are written **verbatim**, leading and trailing spaces included: the service neither
-  decodes nor re-encodes them (an encoded-word in a value stays an encoded-word), and it folds them
-  only at existing white space.
+- The value must be ASCII text, non-empty and not consisting of spaces (U+0020) only (encoding
+  non-ASCII values in custom headers is not part of v1).
+- Values are written **verbatim**, as `Name: ` followed by the value, so leading and trailing
+  spaces stay on the wire: the service neither decodes nor re-encodes them (an encoded-word in a
+  value stays an encoded-word), and it folds them only at existing white space.
 
-**Line length limit.** Every resulting header line is at most 998 characters without `CRLF`, the
-first line counting together with the name and `: `. Headers that the service encodes itself
-(`Subject`, names, file names) can always be split (encoded-words, RFC 2231 continuations). A
-segment without white space in a `headers{}` value, a `cid`, or a `content_type` parameter that
-cannot fit is `INVALID_HEADER` pointing at the field. So three 500-character identifiers separated
-by spaces in `References` are valid; one 1000-character string is not.
+**Folding and line length.** `[D34]`
+
+- Every resulting header line is at most **998** characters without `CRLF` (the hard limit), the
+  first line counting together with the name and `: `. The service aims at **78** (RFC 5322
+  SHOULD) wherever folding allows it, and never produces a line consisting of white space only.
+- Headers that the service encodes itself (`Subject`, names, file names) can always be split
+  (encoded-words, RFC 2231 continuations).
+- `Content-Disposition` and `Content-Type` fold **between parameters** first
+  (`Content-Disposition: attachment;` ⏎ ` filename="…"`).
+- An ASCII file name is written as `filename="…"`. RFC 2231 continuations (`filename*0=`,
+  `filename*1=`, …) are used only when that single parameter does not fit in 78 on its line. A
+  common ASCII name of up to about 60 characters thus keeps the most widely understood form. A
+  non-ASCII file name is always `filename*` (`utf-8''…`), with continuations where needed.
+- A `headers{}` value folds only at its existing white space, aiming at 78.
+- A segment without white space in a `headers{}` value, a `cid`, or a `content_type` parameter that
+  cannot fit in 998 is `INVALID_HEADER` pointing at the field. So three 500-character identifiers
+  separated by spaces in `References` are valid; one 1000-character string is not.
 
 ### 4.6 Control characters
 
@@ -228,8 +269,10 @@ ends up in headers or in protocol commands: addresses (`from` and `reply_to` inc
 subject, file names, `cid`, `content_type`, and the keys and values of `headers{}`. A violation is
 always `INVALID_HEADER` pointing at the field, regardless of which field it occurred in and
 whether the field would have passed its grammar (so a tab in `name` is `INVALID_HEADER`, not "a
-name of white space only"). Unicode format characters (category Cf) are allowed wherever Unicode is
-allowed.
+name of white space only"). The control characters are exactly the Unicode category Cc (C0, `DEL`,
+C1). Unicode format characters (category Cf) and the line and paragraph separators U+2028 and
+U+2029 (categories Zl, Zp) are not control characters: they are allowed wherever Unicode is allowed,
+and are encoded with the rest of the field.
 
 ### 4.7 Validation and limits — order
 
@@ -250,6 +293,21 @@ ends the handling:
    against that value; the smaller one wins → `MESSAGE_TOO_LARGE`. Without a fresh probe only the
    service's own limit applies, and a possible refusal by the server reaches the consumer as a
    result of the conversation (§5). `[D19]`
+
+**Which error wins.** `[D36]` Steps are taken in the order above, and within step 4 the categories
+in the order given there. Between fields, a **fixed schema order** decides — the first failing
+field in this order is reported:
+
+1. `from`, `to`, `cc`, `bcc`, `reply_to` (list by list, element by element, `address` before
+   `name`), `subject`, `text`, `html`;
+2. `inline[]`, element by element, each in the order `cid`, `content_type`, `filename`,
+   `content_base64`;
+3. `attachments[]`, element by element, each in the order `filename`, `content_type`,
+   `content_base64`;
+4. `headers{}`, in request order.
+
+The same order determines `field` and `index` in the envelope (§5.3). It is a rule, not an
+example: the same invalid request always yields the same error.
 
 The limit envelopes carry the threshold, the measured value and the source of the threshold
 (`limit_source`) in `error{}`, so that the consumer does not have to guess which limit was hit:
@@ -285,21 +343,40 @@ The limit envelopes carry the threshold, the measured value and the source of th
 - `accepted` means "the server accepted it for onward delivery", not "delivered".
 - Once the server has answered 2xx after the end of `DATA`, the message is sent — a broken
   connection afterwards (for example at `QUIT`, whose reply is ignored) does not change the result.
-- `duration_ms` is counted until the connection is closed.
+- `duration_ms` is the duration of the conversation: from the start of resolving the server's name
+  until the connection is closed — validation and composition are not included.
 
 ### 5.2 The SMTP conversation
 
 - The conversation is sequential (`PIPELINING` is only reported in health). The service does not
   send `HELO` as a fallback for `EHLO`. `[D20]`
-- When the `EHLO` of the current conversation announced `SIZE`, `MAIL FROM` carries
-  `SIZE=<size_bytes>`, so a server with a hard limit refuses at the `mail_from` stage, before the
-  content is sent. `[D19]`
+- When the `EHLO` of the current conversation (after STARTTLS, the second one) announced `SIZE`,
+  with or without a value, `MAIL FROM` carries `SIZE=<size_bytes>`, so a server with a hard limit
+  refuses at the `mail_from` stage, before the content is sent. `[D19]`
 - When the server accepted no recipient, `DATA` **is not sent**. `[D18]`
+- The content is sent with dot-stuffing (RFC 5321 §4.5.2): a line starting with `.` gets a second
+  `.`. `size_bytes` and `SIZE=` count the message without it (RFC 1870 allows an approximation).
 - Multi-line server replies are joined with `\n` without the codes, and decoded from UTF-8 with
-  invalid bytes replaced.
+  invalid bytes replaced; the code of a multi-line reply is taken from its last line.
+- **A reply outside the expected course** — 3xx to `MAIL FROM` or `RCPT TO`, 2xx to `DATA`
+  instead of 354, a 1xx, a code other than 334 in the middle of `AUTH LOGIN` — is `UPSTREAM_ERROR`
+  at the current stage. After a 2xx to `DATA` the content **is not sent** (the server would read
+  it as commands). A 3xx to `RCPT TO` fits none of `accepted`/`rejected`/`deferred`, so it ends the
+  whole send: that reply goes to `upstream.code`/`message`, and the earlier replies to
+  `recipients[]`. `[D39]`
+- After a failed conversation the service sends `QUIT` on a best-effort basis, with a short limit
+  of its own (1 second), so that it never prolongs a response past the moment its stage failed.
+  After `UPSTREAM_TIMEOUT` or a broken connection it sends no `QUIT` at all — the socket has just
+  shown that it does not answer. Then the connection is closed.
 - `SMTP_TIMEOUT_SECONDS` is the idle limit of every socket operation (not a total per stage, so a
-  large body over a slow link does not exceed it as long as data keeps flowing). The `connect`
-  stage, name resolution included, has one such budget. `[D21]`
+  large body over a slow link does not exceed it as long as data keeps flowing). `[D21]`
+- **The `connect` stage has one deadline** of `SMTP_TIMEOUT_SECONDS`, shared by name resolution
+  and all the connection attempts together — not a budget per address. When the name resolves to
+  several addresses, they are tried in the order the resolver returned them.
+  `UPSTREAM_UNREACHABLE` means that every attempt failed within the deadline; `UPSTREAM_TIMEOUT`
+  with `stage:"connect"` means that the deadline passed before an attempt was settled. In
+  `implicit` mode the TLS handshake that follows is under the idle limit per operation, like any
+  other socket operation, and its stage is still `connect`.
 
 ### 5.3 Error envelope
 
@@ -308,14 +385,24 @@ The limit envelopes carry the threshold, the measured value and the source of th
  "error": {"code": "...", "message": "...",
            "field": "to[1].address", "index": 1,                              // validation errors: path and list index
            "upstream": {"stage": "rcpt_to", "code": 550, "message": "..."},   // conversation errors: stage and server reply
-           "recipients": [...]}}                                             // as on success, without the counters, when the RCPT TO stage took place
+           "message_id": "<...@...>", "size_bytes": 12345, "duration_ms": 420, // conversation errors: the composed message
+           "recipients": [...]}}                                             // as on success, without the counters; see below
 ```
 
 - `field` is a path in the request (`from.address`, `to[1].name`, `reply_to[0].address`,
   `inline[0].cid`, `attachments[2].filename`, `headers.X-Foo`, `subject`); `index` is present
-  only for list elements.
-- In the error envelope `recipients[].status` describes **only the `RCPT TO` stage**, and there are
-  no counters.
+  only for list elements. An unknown field is reported at its own path (`to[0].foo`), a missing
+  required field at the path where it belongs (`from.address`); `inline` without `html` has
+  `field: "inline"`; "no recipient" and "neither `text` nor `html`" have no `field`. The key of a
+  custom header follows `headers.` verbatim.
+- **Every `UPSTREAM_*` envelope carries `message_id`, `size_bytes` and `duration_ms`.** `[D42]`
+  The message is composed by then, and with an unknown outcome (§5.4) its `Message-ID` is the
+  only way for the consumer to check whether it arrived after all; `duration_ms` (§5.1) tells
+  how long the conversation lasted before it failed.
+- `recipients[]` is present — possibly empty — **exactly when `stage` is `rcpt_to`, `data` or
+  `data_end`**, and absent at earlier stages. It lists only the recipients that received a reply;
+  a recipient the conversation did not reach is not listed. `recipients[].status` describes **only
+  the `RCPT TO` stage**, and there are no counters. `[D38]`
 - `upstream.code` is `null` and `message` is descriptive when the server answered nothing (refused
   connection, name resolution, handshake, certificate verification, broken connection, silence),
   or when it did not announce a required capability (STARTTLS, `AUTH`) — `stage` is then the
@@ -381,7 +468,8 @@ Returns **200 always** (the service is alive; the body says how the server is), 
     "host": "...", "port": 587, "tls_mode": "starttls", "auth_configured": true,
     "status": "ok" | "down" | "timeout" | "tls_failed", "checked_age_seconds": 7,
     "capabilities": {"size_max_bytes": 52428800, "starttls": true, "auth_methods": ["PLAIN", "LOGIN"],
-                     "eightbitmime": true, "smtputf8": true, "pipelining": true}
+                     "eightbitmime": true, "smtputf8": true, "pipelining": true},
+    "error": {"stage": "...", "code": null, "message": "..."}     // only when status is not "ok"
   }
 }
 ```
@@ -390,17 +478,28 @@ Returns **200 always** (the service is alive; the body says how the server is), 
   modes `STARTTLS` and `EHLO` again (many servers announce different capabilities after STARTTLS
   than before, authentication mechanisms in particular); **no** `AUTH`, no `MAIL FROM`; then
   `QUIT`.
+- **The probe has one deadline**, `HEALTH_PROBE_TIMEOUT_SECONDS`, for all of it together: name
+  resolution, connection, `EHLO`, `STARTTLS`, `EHLO`, `QUIT`. The idle limit of a send
+  (`SMTP_TIMEOUT_SECONDS`) does not apply to the probe. `[D37]`
 - `capabilities` is present only with `status:"ok"`. `starttls` comes from the first `EHLO`, the
   rest from the last one. `SIZE` without a value, or with zero, means no limit
-  (`size_max_bytes: null`, and no threshold in §4.7).
+  (`size_max_bytes: null`, and no threshold in §4.7). `auth_methods` lists every announced
+  mechanism, upper-cased, in the order announced; the legacy `AUTH=` form is read too.
 - `status` is a closed set:
   - `ok`;
-  - `timeout` — the probe as a whole exceeded `HEALTH_PROBE_TIMEOUT_SECONDS`;
+  - `timeout` — exactly: the probe's deadline passed;
   - `tls_failed` — any situation in which a send would give `UPSTREAM_TLS`; the probe applies the
     same TLS and credential rules as a send, in `implicit` mode to the handshake too;
   - `down` — any other failure: connection, greeting, `EHLO`.
+- **With any status other than `ok`, `upstream.error` says why**, in the shape of `upstream` in the
+  send envelope (§5.3): `stage`, the server's `code` and `message`, or `code: null` and a
+  descriptive `message` when the server said nothing. `[D43]` The password never appears in it in
+  any form — exception messages from TLS and authentication libraries are not passed through as
+  they are.
 - The probe is **lazy**: run on request, no more often than once per `HEALTH_CACHE_TTL_SECONDS`;
-  the response carries the age of the measurement.
+  the response carries the age of the measurement. A failed probe is cached like a successful one.
+  Concurrent requests that find the cache stale wait for one shared probe.
+- `uptime_seconds` and `checked_age_seconds` are integers, rounded down.
 - `ok` is `false` for every status other than `ok`.
 - Every send is its own fresh conversation, independent of the probe. From the probe's cache a
   send takes only the announced `SIZE`, and only when the measurement is fresh (§4.7).
@@ -419,12 +518,27 @@ Returns **200 always** (the service is alive; the body says how the server is), 
 | `SMTP_CA_FILE` | an optional own certificate authority, **added** to the system's trusted authorities | — |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` (or `SMTP_PASSWORD_FILE`) | authentication (§7.2); no variables = no `AUTH` | — |
 | `SMTP_EHLO_NAME` | the name presented in `EHLO`; validated at startup as an RFC 5321 `Domain` (at least one label of letters, digits and hyphens — one label is enough, so the default container hostname passes) or an address literal, with no white space or control characters | the container's hostname |
-| `SMTP_TIMEOUT_SECONDS` | the idle limit of every socket operation (§5.2); fractions allowed | TBD |
-| `MESSAGE_ID_DOMAIN` | the domain in `Message-ID` (§4.5), validated at startup with the domain grammar of §4.2 | the sender's domain |
-| `MAX_REQUEST_BYTES`, `MAX_RECIPIENTS`, `MAX_MESSAGE_BYTES` | the limits of §4.7 | TBD |
-| `HEALTH_CACHE_TTL_SECONDS`, `HEALTH_PROBE_TIMEOUT_SECONDS` | the probe of §6 (the second is the budget of the whole probe); fractions allowed | TBD |
-| `PORT` | the HTTP listening port | TBD |
-| `LOG_LEVEL` | the log level | TBD |
+| `SMTP_TIMEOUT_SECONDS` | the idle limit of every socket operation, and the deadline of the `connect` stage (§5.2); fractions allowed | `60` |
+| `MESSAGE_ID_DOMAIN` | the domain in `Message-ID` (§4.5), validated at startup with the whole domain grammar of §4.2 (an address literal included) | the sender's domain |
+| `MAX_REQUEST_BYTES` | the request body limit (§4.7) | `33554432` (32 MiB) |
+| `MAX_MESSAGE_BYTES` | the composed message limit (§4.7) | `26214400` (25 MiB) |
+| `MAX_RECIPIENTS` | `to` + `cc` + `bcc` together (§4.7) | `100` |
+| `HEALTH_CACHE_TTL_SECONDS` | how long a probe result is reused (§6); fractions allowed | `10` |
+| `HEALTH_PROBE_TIMEOUT_SECONDS` | the deadline of the whole probe (§6); fractions allowed | `5` |
+| `PORT` | the HTTP listening port | `8000` |
+| `LOG_LEVEL` | the log level | `INFO` |
+
+The defaults are a decision `[D41]`. `SMTP_TIMEOUT_SECONDS` is a compromise: RFC 5321 §4.5.3.2
+suggests waiting up to 10 minutes for the reply after `DATA`, while servers scan the content; a
+short limit makes an unknown outcome (§5.4) more likely, a long one holds the consumer's HTTP
+connection open.
+
+**`SMTP_EHLO_NAME` is a `Domain`, not an address domain.** `[D40]` The rule of §4.2 that the last
+label is not all digits does not apply to it: that rule keeps an address domain from being mistaken
+for an IPv4 address, and the definition above is complete without it. A default container hostname
+(12 hexadecimal characters) is all digits about once in 300 starts; under that rule the image would
+fail to start at random. `MESSAGE_ID_DOMAIN` keeps the whole grammar of §4.2, because it ends up in a
+header as a domain.
 
 The README warns that a name without a dot in `SMTP_EHLO_NAME` is sometimes refused by servers that
 require an FQDN.
@@ -439,9 +553,10 @@ require an FQDN.
   `UPSTREAM_TLS` before `AUTH` — the password never goes in plain text.
 - STARTTLS that is **announced** and fails (refusal, handshake, verification) is `UPSTREAM_TLS` in
   every STARTTLS mode — the service never falls back to plain text after a failed TLS attempt.
-- Authentication: `PLAIN` (RFC 4616, with an empty authorisation identity) when announced,
-  otherwise `LOGIN`. One attempt, no switching of mechanism after a refusal. `[D27]` The password
-  is UTF-8. From a file, exactly one trailing line ending (`\n` or `\r\n`) is removed.
+- Authentication: `PLAIN` (RFC 4616, with an empty authorisation identity, sent as the initial
+  response on the `AUTH` line) when announced, otherwise `LOGIN`. One attempt, no switching of
+  mechanism after a refusal. `[D27]` The password is UTF-8. From a file, exactly one trailing line
+  ending (`\n` or `\r\n`) is removed.
 
 ### 7.3 Startup validation
 
@@ -450,6 +565,25 @@ A contradictory or unreadable configuration stops startup with a readable messag
 password; an unknown TLS mode; an unreadable CA file; a non-ASCII `SMTP_HOST`; an invalid
 `SMTP_EHLO_NAME` or `MESSAGE_ID_DOMAIN`; `SMTP_TLS=none` with credentials. Otherwise the image starts
 with sensible defaults: only `SMTP_HOST` is needed to run it.
+
+How values are read:
+
+- An empty variable means the same as an unset one.
+- Booleans are `true`/`false`/`1`/`0`, case-insensitive.
+- Numbers must be greater than zero.
+- `SMTP_TLS` takes exactly the values of §7.1, in lower case.
+- An IPv6 address in `SMTP_HOST` is written without brackets.
+- `SMTP_CA_FILE` is ignored, and not read, when `SMTP_TLS=none` or `SMTP_TLS_VERIFY=false`.
+
+Anything else that cannot be read stops startup too: a value that is not a valid number or boolean,
+a port outside 1–65535, a password without a user.
+
+**Shutdown.** On `SIGTERM` the service stops accepting requests and lets the sends in progress
+finish, within the server's graceful-shutdown time. The README tells operators to give the
+container a stop grace period (`stop_grace_period` / `--stop-timeout`) with a margin over
+`SMTP_TIMEOUT_SECONDS`: otherwise a send in progress is killed in the middle of `DATA`, and the
+consumer gets a broken HTTP connection with no response — the same kind of uncertainty §5.4
+describes for `data_end`, on the HTTP leg.
 
 ## 8. Security
 
@@ -467,9 +601,15 @@ with sensible defaults: only `SMTP_HOST` is needed to run it.
 
 ## 9. Logging
 
+JSON lines on stdout, no log files; one event line per request; the HTTP server's own access log is
+off (it would duplicate that line).
+
 Logs carry `dispatch_id`, the sender, the number of recipients and their domains, the size, the
-stage and result of the conversation, and the duration — **never** the content, the subject, the
-attachments, the full recipient lists or the password. `[D30]`
+stage and result of the conversation — the stage, the reply codes (with the enhanced status code,
+such as `5.1.1`, when there is one) and the counters — and the duration. They **never** carry the
+content, the subject, the attachments, the full recipient lists, the password, or **the text of a
+server reply**: SMTP replies often quote a recipient's address (`550 5.1.1 <…>: user unknown`).
+The reply text goes only to the HTTP response. `[D30]`
 
 ## 10. Testing contract
 
@@ -488,7 +628,15 @@ attachments, the full recipient lists or the password. `[D30]`
 - Settings (limits, TTL, timeouts in fractions of a second) are injected per test; "the service
   does not start" means that loading the configuration ends in an error.
 - The read-only file system property concerns the service, not the test harness, which may keep
-  certificates in a temporary directory.
+  certificates in a temporary directory. `[D46]` It is proven twice:
+  - the full suite runs in CI inside a `test` stage of the `Dockerfile` (the runtime plus the
+    development dependencies) started with `--read-only --tmpfs /tmp --network none` — the
+    `tmpfs` is for the harness's certificates, and since the fake listens on loopback, the missing
+    network also proves the isolation;
+  - a smoke test runs the **release image** with `--read-only` and **without** any `tmpfs`, which
+    proves that the service itself needs no writable path at all.
+- The fake SMTP server of the example `docker-compose` (§12) is a convenience for local trials, not
+  a dependency of the project or of its tests.
 
 ### 10.2 Acceptance cases
 
@@ -498,7 +646,10 @@ appended.
 1. `text` only → `text/plain`, content identical after decoding (after line-ending
    normalisation); pure ASCII → `quoted-printable`; content dominated by non-ASCII bytes →
    `base64`; `Date` in the format of §4.5, `Message-ID` per §4.5, `MIME-Version`, `Subject`
-   present for `subject:""` too; `size_bytes` equal to the number of §4.7 step 6.
+   present for `subject:""` too; `size_bytes` equal to the number of §4.7 step 6. **Dot
+   transparency:** a content with a line starting with `.` and a line consisting of a single `.`
+   comes out identical after decoding — which proves the client's dot-stuffing and its removal on
+   the fake's side (§5.2).
 2. `html` only → `text/html`; `html` + `inline` → `multipart/related` with `type="text/html"` and a
    part with `Content-ID: <cid>` and inline disposition, image bytes identical to the input;
    `inline` without `filename` → a part without a name parameter.
@@ -532,7 +683,8 @@ appended.
    `inline` without `html`, `from` without `address`, an unknown field, a repeated JSON key, a lone
    surrogate → `INVALID_REQUEST`.
 9. `content_base64` that cannot be decoded, a duplicate `cid`, `content_type: "multipart/mixed"`
-   and `"message/rfc822"`, a file name with `/`, `\` or `..` → `INVALID_CONTENT`.
+   and `"message/rfc822"`, a file name containing `/` or `\`, a file name equal to `..` →
+   `INVALID_CONTENT`; a file name that merely contains `..` (`report..pdf`) → accepted.
 10. Limits: a request over `MAX_REQUEST_BYTES` (also without `Content-Length`; a wrong
     `Content-Type` with a body over the limit → `INVALID_REQUEST`, because the type is checked
     first) and a message over `MAX_MESSAGE_BYTES` → the right code with
@@ -610,12 +762,22 @@ health, `limit_source`), is not, and requires `/v2`. The container image carries
 ## 12. Delivery
 
 - A public repository: code, a `Dockerfile` on a stock, slim Python image (without root), an
-  example `docker-compose` with a fake SMTP server for local trials (any ready-made one that shows
-  the accepted messages), a README with the contract and `curl` examples, automated tests, the MIT
-  licence, and this file as the authority on the contract with its decision record.
-- Release: a version tag; a CHANGELOG with the image digest and its Id; **the image archive
-  (`docker save` by the full tag, `.tar.gz` + `.sha256`) as a release file** for hosts without
-  access to the registry.
+  example `docker-compose` with a fake SMTP server for local trials (Mailpit, which shows the
+  accepted messages in a browser and speaks STARTTLS and AUTH), a README with the contract and
+  `curl` examples, automated tests, the MIT licence, and this file as the authority on the contract
+  with its decision record. `docs/spec-coverage.md` maps every acceptance case to its test.
+- The implementation: Python 3.13, managed with uv; FastAPI on uvicorn; settings with
+  pydantic-settings; ruff and `mypy --strict`; pytest with coverage of at least 90%. The SMTP client
+  is the service's own, on asyncio. `[D44]`
+- The image: a two-stage `Dockerfile` that also builds with the classic builder (no BuildKit-only
+  syntax); the runtime on Debian's `python:3.13-slim`; a non-root user (uid 10001); a
+  `HEALTHCHECK` written with the standard library. It is published for amd64 only, and runs on
+  **baseline x86-64**, with no x86-64-v2 requirement — so a base image that needs v2 is ruled out.
+  `[D45]`
+- Release: an annotated version tag, starting at `0.1.0`; the image is published to GHCR by a
+  workflow on that tag; a CHANGELOG with the image digest and its Id; **the image archive
+  (`docker save` by the full tag, `.tar.gz` + `.sha256`) as a release file**, made by a separate
+  job, for hosts without access to the registry.
 - Configuration only through environment variables (§7).
 
 The project has to stand on its own: someone who finds it without context should know from the
@@ -628,7 +790,12 @@ The README says explicitly, among the rest:
 - which responses settle the outcome and which leave it unknown (§5.4);
 - that content goes out verbatim and the service is not an HTML sanitiser (§8);
 - that `SMTP_PORT` should be set to `465` for `implicit` mode (§7.1);
-- that an `SMTP_EHLO_NAME` without a dot is refused by some servers (§7.1).
+- that an `SMTP_EHLO_NAME` without a dot is refused by some servers (§7.1);
+- that a `/v1/send` response may take longer than `SMTP_TIMEOUT_SECONDS`, because that limit is
+  renewed by every socket operation (`[D21]`), so the consumer's own HTTP timeout must have a wide
+  margin over it, not equal it — a consumer that sets both to the same value will meet the
+  duplicate §5.4 warns about;
+- that the container's stop grace period needs a margin over `SMTP_TIMEOUT_SECONDS` (§7.3).
 
 ## 13. Decision record
 
@@ -657,7 +824,9 @@ The README says explicitly, among the rest:
   depend on the host; the table never yields `message/*` or `multipart/*`.
 - **[D11] The transfer encoding is a rule.** `text`/`html`: `quoted-printable` up to one third of
   bytes outside 32–126, `base64` above; parts always `base64`; never `7bit`/`8bit`, so the message
-  is valid without `8BITMIME`, and no `BODY=`/`SMTPUTF8` is sent.
+  is valid without `8BITMIME`, and no `BODY=`/`SMTPUTF8` is sent. The denominator counts every byte,
+  `CRLF` included, and the numerator leaves `CRLF` out, so empty content is `quoted-printable` —
+  no special case.
 - **[D12] `multipart/*` and `message/*` are refused as part types.** Structure is the service's;
   RFC 2046 forbids `base64` for `message/*`, so a message travels as `application/octet-stream`.
 - **[D13] Composition is deterministic.** Fixed header order and fixed part order; only `Date`,
@@ -678,8 +847,10 @@ The README says explicitly, among the rest:
 - **[D20] The conversation is sequential, and there is no `HELO` fallback.** `PIPELINING` is only
   reported.
 - **[D21] The SMTP timeout is an idle limit per socket operation, not a total per stage.** A large
-  body over a slow link does not time out while data flows; name resolution and connecting share
-  one budget.
+  body over a slow link does not time out while data flows. The `connect` stage is the exception:
+  one deadline for name resolution and every connection attempt together, addresses tried in the
+  resolver's order; all failing within it is `UPSTREAM_UNREACHABLE`, running out of it is
+  `UPSTREAM_TIMEOUT`.
 - **[D22] The unknown-outcome cases are named in the contract** (`data_end` timeout or error,
   `INTERNAL_ERROR`), and the README states them.
 - **[D23] An authentication failure is 502, not 401.** It is the service's configuration, not the
@@ -697,10 +868,56 @@ The README says explicitly, among the rest:
 - **[D28] A contradictory or unreadable configuration stops startup** with a readable message; only
   `SMTP_HOST` is required.
 - **[D29] Nothing is written to disk.** Non-root, read-only file system.
-- **[D30] Logs never carry content, the subject, attachments, full recipient lists or the
-  password.**
+- **[D30] Logs never carry content, the subject, attachments, full recipient lists, the password
+  or the text of a server reply.** A reply often quotes a recipient's address, so logs keep the
+  stage, the codes and the counters, and the text goes only to the HTTP response.
 - **[D31] `/v1` and the closed value sets are the contract.** Changing a closed set needs `/v2`;
   `latest` is not a contract.
+
+**Settled in clarification, 2026-10-07**
+
+- **[D32] A file name is refused only when it is a path or a path step:** it contains `/` or `\`,
+  or it equals `.` or `..`. A name that merely contains `..` cannot step out of anything without a
+  separator, so it is valid.
+- **[D33] Every error envelope carries a fresh `dispatch_id`**, whatever the path and method, so
+  there is one envelope shape; only a successful health response has none.
+- **[D34] Headers aim at 78 characters a line and never exceed 998.** Parameters fold between one
+  another first; an ASCII file name uses RFC 2231 continuations only when the single parameter
+  does not fit in 78, so common names keep the most widely understood `filename="…"` form; custom
+  values fold only at their own white space, and never into a line of white space only.
+- **[D35] "Spaces only" means the Unicode `White_Space` property** for names and file names, and
+  U+0020 for the ASCII values of custom headers — named by the property, so that it does not depend
+  on what a language's `isspace` happens to include.
+- **[D36] The first error in a fixed schema order wins**, and the same order gives `field` and
+  `index`: the same invalid request always gets the same error.
+- **[D37] The health probe has one deadline for all of it**, and `timeout` means exactly that the
+  deadline passed; the idle limit of a send does not apply.
+- **[D38] `recipients[]` in an error envelope is present exactly at the stages `rcpt_to`, `data`
+  and `data_end`**, possibly empty, and lists only the recipients that received a reply — the closed
+  status set has no "not attempted".
+- **[D39] A reply outside the expected course is `UPSTREAM_ERROR` at the current stage.** After a
+  2xx to `DATA` the content is not sent, because the server would read it as commands; a 3xx to
+  `RCPT TO` ends the send, since it fits none of the recipient statuses.
+- **[D40] `SMTP_EHLO_NAME` is an RFC 5321 `Domain`, and the all-digits rule for the last label of
+  an address domain does not apply to it.** A default container hostname is all digits about once in
+  300 starts, and the image must not fail to start at random. `MESSAGE_ID_DOMAIN` keeps the address
+  grammar, because it lands in a header as a domain.
+- **[D41] The defaults are fixed** (§7.1). `SMTP_TIMEOUT_SECONDS=60` trades the RFC's long wait
+  after `DATA` against how long the consumer's HTTP connection is held.
+- **[D42] Every `UPSTREAM_*` envelope carries `message_id`, `size_bytes` and `duration_ms`.** With an
+  unknown outcome the `Message-ID` is the only way to check whether the message arrived; a
+  backwards-compatible addition.
+- **[D43] Health says why it is not `ok`**, in `upstream.error`, with the shape of the send
+  envelope's `upstream`; the password never appears in it.
+- **[D44] The SMTP client is the service's own, on asyncio, not `smtplib`.** `smtplib` breaks the
+  contract in several places: it encodes `AUTH` as ASCII while the password is UTF-8, `login()`
+  switches mechanisms after a refusal, name resolution has no time limit, and its helpers fall
+  back to `HELO`.
+- **[D45] The image runs on baseline x86-64.** Debian's `python:3.13-slim` meets that; a base image
+  that needs x86-64-v2 does not.
+- **[D46] The read-only file system is proven twice:** the suite runs in a `test` image stage with
+  `--read-only --tmpfs /tmp --network none`, and the release image runs with `--read-only` and no
+  `tmpfs` at all, which proves the service needs no writable path.
 
 ## 14. Explicitly out of scope (v1)
 
