@@ -1,6 +1,6 @@
 # mail-dispatch — functional specification
 
-**Status: DRAFT (2026-10-07), under clarification; two rounds of answers are applied.**
+**Status: DRAFT (2026-10-07), clarified in three rounds; awaiting approval.**
 Once approved, this file is the source of truth for implementation and the authority on the
 contract. Design decisions are marked `[D#]` inline and recorded in
 [§13](#13-decision-record); defects are reported against those numbers.
@@ -516,15 +516,20 @@ Returns **200 always** (the service is alive; the body says how the server is), 
   than before, authentication mechanisms in particular); **no** `AUTH`, no `MAIL FROM`; then
   `QUIT`.
 - **The probe has one deadline**, `HEALTH_PROBE_TIMEOUT_SECONDS`, for all of it together: name
-  resolution, connection, `EHLO`, `STARTTLS`, `EHLO`, `QUIT`. The idle limit of a send
-  (`SMTP_TIMEOUT_SECONDS`) does not apply to the probe. `[D37]`
+  resolution, connection, `EHLO`, `STARTTLS`, `EHLO`, `QUIT` — a health response never comes later
+  than that. The idle limit of a send (`SMTP_TIMEOUT_SECONDS`) does not apply to the probe. `[D37]`
+- **The measurement ends with the reply to the last `EHLO`** (in the STARTTLS modes, the second
+  one), or with the failure that ends the probe earlier; `checked_age_seconds` counts from that
+  moment. `QUIT` lies outside the measurement both ways: it is sent on a best-effort basis in
+  whatever time the deadline leaves, and neither its failure nor the deadline passing during it
+  changes the result or the age of the measurement.
 - `capabilities` is present only with `status:"ok"`. `starttls` comes from the first `EHLO`, the
   rest from the last one. `SIZE` without a value, or with zero, means no limit
   (`size_max_bytes: null`, and no threshold in §4.7). `auth_methods` lists every announced
   mechanism, upper-cased, in the order announced; the legacy `AUTH=` form is read too.
 - `status` is a closed set:
   - `ok`;
-  - `timeout` — exactly: the probe's deadline passed;
+  - `timeout` — exactly: the probe's deadline passed before the measurement ended;
   - `tls_failed` — any situation in which a send would give `UPSTREAM_TLS`; the probe applies the
     same TLS and credential rules as a send, in `implicit` mode to the handshake too;
   - `down` — any other failure: connection, greeting, `EHLO`.
@@ -621,6 +626,16 @@ container a stop grace period (`stop_grace_period` / `--stop-timeout`) with a ma
 `SMTP_TIMEOUT_SECONDS`: otherwise a send in progress is killed in the middle of `DATA`, and the
 consumer gets a broken HTTP connection with no response — the same kind of uncertainty §5.4
 describes for `data_end`, on the HTTP leg.
+
+**Concurrency and memory.** `[D48]` v1 sets no limit on concurrent sends and has no "busy" code.
+The consumer controls how many sends run in parallel; the operator bounds memory with the
+container's limits. The README gives the memory account of one send in progress, naming the parts
+that live at the same time — the request body up to `MAX_REQUEST_BYTES`, the decoded attachments,
+the composed message up to `MAX_MESSAGE_BYTES` — because an operator sizes a container from the
+ceilings, not from a typical message. It also says what happens when the limit is too tight: a
+container killed for exceeding its memory limit leaves an **unknown outcome for every send in
+progress** at that moment — the class of §5.4, wholesale. A tight limit does not refuse the
+excess; it loses responses.
 
 ## 8. Security
 
@@ -841,7 +856,9 @@ The README says explicitly, among the rest:
 - that `/v1/send` has no hard upper bound on its duration (§5.6), so the consumer's own HTTP
   timeout should be generous; that running out of it before `data_end` sends nothing; and that
   `data_end` is the only window of uncertainty (§5.4);
-- that the container's stop grace period needs a margin over `SMTP_TIMEOUT_SECONDS` (§7.3).
+- that the container's stop grace period needs a margin over `SMTP_TIMEOUT_SECONDS` (§7.3);
+- the memory account of one send in progress, from the ceilings, and what a container killed for
+  memory means for the sends in progress (§7.3).
 
 ## 13. Decision record
 
@@ -937,7 +954,9 @@ The README says explicitly, among the rest:
 - **[D36] The first error in a fixed schema order wins**, and the same order gives `field` and
   `index`: the same invalid request always gets the same error.
 - **[D37] The health probe has one deadline for all of it**, and `timeout` means exactly that the
-  deadline passed; the idle limit of a send does not apply.
+  deadline passed before the measurement ended; the idle limit of a send does not apply. The
+  measurement ends with the reply to the last `EHLO`; the age counts from there, and `QUIT` lies
+  outside it both ways — sent in whatever time is left, changing neither the result nor the age.
 - **[D38] `recipients[]` in an error envelope is present exactly at the stages `rcpt_to`, `data`
   and `data_end`**, possibly empty, and lists only the recipients that received a reply — the closed
   status set has no "not attempted".
@@ -975,6 +994,10 @@ The README says explicitly, among the rest:
   consumer has the unknown outcome of §5.4. The log records an abort by the client as an outcome of
   its own. There is no overall send deadline: it would add unknown outcomes the server never
   caused.
+- **[D48] v1 has no limit on concurrent sends and no "busy" code.** The consumer controls
+  parallelism, the operator bounds memory with container limits, and the README gives the memory
+  account from the ceilings. Refusing under load, under any code, would extend the closed `code`
+  set and so needs `/v2` (`[D31]`) — left out on purpose, not overlooked.
 
 ## 14. Explicitly out of scope (v1)
 
