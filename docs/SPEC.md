@@ -1,6 +1,6 @@
 # mail-dispatch — functional specification
 
-**Status: DRAFT (2026-10-07), clarified in three rounds; awaiting approval.**
+**Status: DRAFT (2026-10-08), clarified; awaiting approval.**
 Once approved, this file is the source of truth for implementation and the authority on the
 contract. Design decisions are marked `[D#]` inline and recorded in
 [§13](#13-decision-record); defects are reported against those numbers.
@@ -221,8 +221,11 @@ order, then the structure's `Content-*` headers. `[D13]`
 
 - `Subject` is always present, with an empty value too.
 - The subject and names are encoded per RFC 2047 when they contain anything outside printable
-  ASCII, and also when they are ASCII but contain `=?` — otherwise a recipient would decode that
-  text as an encoded-word, and it would not read back identical.
+  ASCII; also when they are ASCII but contain `=?` — otherwise a recipient would decode that text
+  as an encoded-word, and it would not read back identical; and also when, without encoding, the
+  header line could not be folded within 998 characters (an ASCII run without white space longer
+  than a line) — encoded-words split into pieces of at most 75 characters, so "can always be
+  split" below holds by construction. `[D34]`
 - `Date` is an RFC 5322 `date-time` of the moment of composition, in UTC written as `+0000`.
 - `Message-ID` has the form `<random-token@domain>`: the token is random and cannot be derived from
   the content; the domain comes from `MESSAGE_ID_DOMAIN` (validated at startup like an address
@@ -301,9 +304,8 @@ ends the handling:
    result of the conversation (§5). `[D19]`
 
 **Which error wins.** `[D36]` Steps are taken in the order above, and within step 4 the categories
-in the order given there. Between fields of the same category, a **fixed schema order** decides
-— the first failing
-field in this order is reported:
+in the order given there. Between fields of the same category, a **fixed schema order** decides —
+the first failing field in this order is reported:
 
 1. `from`, `to`, `cc`, `bcc`, `reply_to` (list by list, element by element, `address` before
    `name`), `subject`, `text`, `html`;
@@ -536,7 +538,7 @@ Returns **200 always** (the service is alive; the body says how the server is), 
 
 ```jsonc
 {
-  "ok": true, "version": "1.2.0", "uptime_seconds": 864,
+  "ok": true, "version": "0.1.0", "uptime_seconds": 864,
   "upstream": {
     "host": "...", "port": 587, "tls_mode": "starttls", "auth_configured": true,
     "status": "ok" | "down" | "timeout" | "tls_failed", "checked_age_seconds": 7,
@@ -751,7 +753,9 @@ appended.
    parameter → `INVALID_CONTENT`.
 4. Non-ASCII subject and `name` → headers encoded per RFC 2047, identical after decoding; a `name`
    of spaces only → as if absent; a non-ASCII file name and a 200-character file name → RFC 2231,
-   identical after decoding.
+   identical after decoding; a subject and a `name` of 1000 ASCII characters without white space →
+   accepted, encoded per RFC 2047, identical after decoding, and every resulting line at most 998
+   characters (asserted on the raw message).
 5. `bcc` → the address in the SMTP envelope (`RCPT TO`), **absent** from every header; `cc` → in the
    envelope and in `Cc`; empty `to` → no `To` header; `reply_to` with two entries → one `Reply-To`
    with two addresses in request order; `from` equal to a recipient → success.
@@ -815,9 +819,9 @@ appended.
     `AUTH` → `UPSTREAM_AUTH` with `stage:"auth"` and `code:null`; a wrong password → `UPSTREAM_AUTH`
     after one attempt, the password absent from the logs and from the response; a fake offering
     only `LOGIN` that answers `535` right after the user-name step → `UPSTREAM_AUTH` with
-    `stage:"auth"` and no second attempt; credentials in
-    `starttls-opportunistic` mode without TLS → `UPSTREAM_TLS` and **no** `AUTH` in the fake's
-    record; `SMTP_TLS=none` with credentials → the service does not start.
+    `stage:"auth"` and no second attempt; credentials in `starttls-opportunistic` mode without TLS
+    → `UPSTREAM_TLS` and **no** `AUTH` in the fake's record; `SMTP_TLS=none` with credentials → the
+    service does not start.
 18. Health: two calls within the TTL → **one** probe; a fake announcing `SIZE` and `AUTH` after
     STARTTLS → matching `capabilities`, `starttls:true` from the first `EHLO`; `SIZE` without a
     value → `size_max_bytes: null`; the fake switched off → `ok:false`, `status:"down"`, no
@@ -1000,7 +1004,10 @@ The README says explicitly, among the rest:
 - **[D34] Headers aim at 78 characters a line and never exceed 998.** Parameters fold between one
   another first; an ASCII file name uses RFC 2231 continuations only when the single parameter
   does not fit in 78, so common names keep the most widely understood `filename="…"` form; custom
-  values fold only at their own white space, and never into a line of white space only.
+  values fold only at their own white space, and never into a line of white space only. A subject
+  or name that could not be folded within 998 as plain ASCII is encoded per RFC 2047, so the
+  headers the service writes itself can always be split; only a custom value, a `cid` or a
+  `content_type` parameter can be refused for length.
 - **[D35] "Spaces only" means the Unicode `White_Space` property** for names and file names, and
   U+0020 for the ASCII values of custom headers — named by the property, so that it does not depend
   on what a language's `isspace` happens to include.
