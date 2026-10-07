@@ -1,6 +1,6 @@
 # mail-dispatch — functional specification
 
-**Status: DRAFT (2026-10-07), under clarification; the first round of answers is applied.**
+**Status: DRAFT (2026-10-07), under clarification; two rounds of answers are applied.**
 Once approved, this file is the source of truth for implementation and the authority on the
 contract. Design decisions are marked `[D#]` inline and recorded in
 [§13](#13-decision-record); defects are reported against those numbers.
@@ -306,6 +306,17 @@ field in this order is reported:
    `content_base64`;
 4. `headers{}`, in request order.
 
+Step 2 follows the same order, depth first. A byte-order mark, invalid JSON and a repeated key are
+found while parsing, before anything else. Then, for every object, starting with the top level:
+
+1. its unknown keys, in request order — a misspelt field is reported as unknown before its correct
+   name is reported as missing;
+2. its known fields in schema order, each checked for presence and type, a string also for valid
+   Unicode, before the check descends into the field's contents and moves on to the next field.
+
+The rules that span fields come after the walk, in this order: no recipient; neither `text` nor
+`html`; `inline` without `html`.
+
 The same order determines `field` and `index` in the envelope (§5.3). It is a rule, not an
 example: the same invalid request always yields the same error.
 
@@ -424,7 +435,8 @@ The README says this explicitly. `[D22]`
   **unknown outcome** — the server may have accepted the message, and a retry may duplicate it.
 
 This is the only SMTP ambiguity that a transport cannot remove, and the consumer must know it when
-deciding about a retry (§2).
+deciding about a retry (§2). A consumer whose own HTTP timeout runs out meets the same boundary
+(§5.6).
 
 ### 5.5 Error codes
 
@@ -455,6 +467,31 @@ deciding about a retry (§2).
   `[D23]`
 - SMTP carries no "when to retry" information, so 503 responses have no `Retry-After` header.
   `[D24]`
+
+### 5.6 When the HTTP client goes away
+
+`/v1/send` has **no hard upper bound on its duration**: the idle limit is renewed by every socket
+operation (`[D21]`), and the number of operations grows with the recipients, while the content
+takes as long as it takes to flow. A consumer's own HTTP timeout can therefore always run out, and
+the consumer then closes the connection. What the service does depends on one moment: **the
+issuing of the write of the final `CRLF.CRLF` to the socket**. `[D47]`
+
+- **The client went away before that write** (every stage up to and including `data`): the service
+  aborts the conversation — it closes the SMTP socket at once, without `QUIT` and without finishing
+  `DATA`. Without the end-of-data marker the server does not accept the message (RFC 5321), so the
+  message was handed to nobody, and a retry by the consumer does not duplicate it. A client that is
+  gone before the connection is opened gets no connection opened at all.
+- **The client went away after that write** (`data_end`): nothing can be taken back. The service
+  waits for the server's reply as usual and logs the result. For the consumer this is the unknown
+  outcome of §5.4.
+- A disconnection noticed before the write is issued aborts; one noticed after it waits. The race
+  of one write between the two cannot be removed, as in case 14, where the stage is `data` or
+  `data_end` depending on buffers.
+
+The log is then the only trace, so the log event records the outcome **"aborted by the client"** as
+a result of its own, with the stage at which it happened — distinct from any failure on the server's
+side. In the second case the event carries the server's final reply, as for any send — its codes,
+never its text (`[D30]`) — under the same `dispatch_id`.
 
 ## 6. `GET /v1/health`
 
@@ -609,7 +646,8 @@ stage and result of the conversation — the stage, the reply codes (with the en
 such as `5.1.1`, when there is one) and the counters — and the duration. They **never** carry the
 content, the subject, the attachments, the full recipient lists, the password, or **the text of a
 server reply**: SMTP replies often quote a recipient's address (`550 5.1.1 <…>: user unknown`).
-The reply text goes only to the HTTP response. `[D30]`
+The reply text goes only to the HTTP response. `[D30]` A send aborted because the HTTP client went
+away is logged as an outcome of its own, with its stage (§5.6).
 
 ## 10. Testing contract
 
@@ -742,6 +780,13 @@ appended.
 21. The envelope always: an unknown path → `NOT_FOUND`, a wrong method → `METHOD_NOT_ALLOWED`, a
     forced exception inside the handling → `INTERNAL_ERROR` with `dispatch_id`, all as JSON per
     §5.3.
+22. The HTTP client goes away (§5.6): (a) the fake stays silent at `RCPT TO` and the HTTP client
+    closes its connection after a short time → the fake sees its socket closed and records no
+    message, and the log has an "aborted by the client" event with `stage:"rcpt_to"`; (b) the fake
+    stays silent **after receiving the final `.`**, the HTTP client closes its connection, and the
+    fake then answers `250` with a delay → the fake records the message, and the log has an event
+    with the result `250` under the same `dispatch_id`. Together they prove that the boundary lies
+    where §5.6 puts it.
 
 ### 10.3 Robustness
 
@@ -770,10 +815,12 @@ health, `limit_source`), is not, and requires `/v2`. The container image carries
   pydantic-settings; ruff and `mypy --strict`; pytest with coverage of at least 90%. The SMTP client
   is the service's own, on asyncio. `[D44]`
 - The image: a two-stage `Dockerfile` that also builds with the classic builder (no BuildKit-only
-  syntax); the runtime on Debian's `python:3.13-slim`; a non-root user (uid 10001); a
-  `HEALTHCHECK` written with the standard library. It is published for amd64 only, and runs on
-  **baseline x86-64**, with no x86-64-v2 requirement — so a base image that needs v2 is ruled out.
-  `[D45]`
+  syntax); the runtime on **`python:3.13-slim-trixie`** (Debian 13), pinned by its codename rather
+  than the moving `python:3.13-slim`, and the build stage on the same Debian release (another glibc
+  and other shared libraries under compiled wheels are a classic trap); a non-root user
+  (uid 10001); a `HEALTHCHECK` written with the standard library. It is published for amd64 only,
+  and runs on **baseline x86-64**, with no x86-64-v2 requirement — so a base image that needs v2 is
+  ruled out. `[D45]`
 - Release: an annotated version tag, starting at `0.1.0`; the image is published to GHCR by a
   workflow on that tag; a CHANGELOG with the image digest and its Id; **the image archive
   (`docker save` by the full tag, `.tar.gz` + `.sha256`) as a release file**, made by a separate
@@ -791,10 +838,9 @@ The README says explicitly, among the rest:
 - that content goes out verbatim and the service is not an HTML sanitiser (§8);
 - that `SMTP_PORT` should be set to `465` for `implicit` mode (§7.1);
 - that an `SMTP_EHLO_NAME` without a dot is refused by some servers (§7.1);
-- that a `/v1/send` response may take longer than `SMTP_TIMEOUT_SECONDS`, because that limit is
-  renewed by every socket operation (`[D21]`), so the consumer's own HTTP timeout must have a wide
-  margin over it, not equal it — a consumer that sets both to the same value will meet the
-  duplicate §5.4 warns about;
+- that `/v1/send` has no hard upper bound on its duration (§5.6), so the consumer's own HTTP
+  timeout should be generous; that running out of it before `data_end` sends nothing; and that
+  `data_end` is the only window of uncertainty (§5.4);
 - that the container's stop grace period needs a margin over `SMTP_TIMEOUT_SECONDS` (§7.3).
 
 ## 13. Decision record
@@ -913,11 +959,22 @@ The README says explicitly, among the rest:
   contract in several places: it encodes `AUTH` as ASCII while the password is UTF-8, `login()`
   switches mechanisms after a refusal, name resolution has no time limit, and its helpers fall
   back to `HELO`.
-- **[D45] The image runs on baseline x86-64.** Debian's `python:3.13-slim` meets that; a base image
-  that needs x86-64-v2 does not.
+- **[D45] The image runs on baseline x86-64, on Debian 13 (trixie) pinned by codename.** Debian
+  builds amd64 for the baseline, so `python:3.13-slim-trixie` meets that; a base image that needs
+  x86-64-v2 does not. The build stage runs on the same Debian release as the runtime. The codename
+  pins Debian, not Python or the base: the image is rebuilt under the same tag with new 3.13.x
+  releases and base fixes, and the release process already records what was shipped (the Image Id
+  in the CHANGELOG, the archive as a release file). The proof in CI is the release image running
+  on a standard runner — no CPU emulation.
 - **[D46] The read-only file system is proven twice:** the suite runs in a `test` image stage with
   `--read-only --tmpfs /tmp --network none`, and the release image runs with `--read-only` and no
   `tmpfs` at all, which proves the service needs no writable path.
+- **[D47] When the HTTP client goes away, the issuing of the final `CRLF.CRLF` write decides.**
+  Before it, the conversation is aborted and nothing is handed over, so a consumer's retry after
+  its own timeout does not duplicate; after it, the service waits and logs the result, and the
+  consumer has the unknown outcome of §5.4. The log records an abort by the client as an outcome of
+  its own. There is no overall send deadline: it would add unknown outcomes the server never
+  caused.
 
 ## 14. Explicitly out of scope (v1)
 
