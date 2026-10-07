@@ -253,7 +253,7 @@ order, then the structure's `Content-*` headers. `[D13]`
   (encoded-words, RFC 2231 continuations).
 - `Content-Disposition` and `Content-Type` fold **between parameters** first
   (`Content-Disposition: attachment;` ⏎ ` filename="…"`).
-- In a quoted string the service writes — an ASCII display name or `filename="…"` — a `"` is
+- In a quoted string that the service writes (an ASCII display name, or `filename="…"`), a `"` is
   written as the quoted pair `\"` (RFC 5322 / RFC 2045 `quoted-string`), and a `\` in a display
   name as `\\`; the escaped form is what counts towards line length.
 - An ASCII file name is written as `filename="…"`. RFC 2231 continuations (`filename*0=`,
@@ -426,7 +426,8 @@ was composed (below).
   message was composed, `message_id` and `size_bytes`; once the conversation had started, also
   `duration_ms` and `upstream` with the stage reached (`code: null`, a fixed descriptive
   `message` — never the exception's own text), and `recipients[]` by the rule below. Fields that
-  were not reached are absent, never `null`. `[D42]`
+  were not reached are absent, never `null`. What was reached stays reached until the HTTP response
+  is written: after the final 2xx the stage is still `data_end` (§5.4). `[D42]`
 - `recipients[]` is present — possibly empty — **exactly when `stage` is `rcpt_to`, `data` or
   `data_end`**, and absent at earlier stages. It lists only the recipients that received a reply;
   a recipient the conversation did not reach is not listed. `recipients[].status` describes **only
@@ -440,21 +441,34 @@ was composed (below).
   is in `recipients[]`.
 - `stage` is a closed set: `connect` (including the TLS handshake in `implicit` mode), `greeting`,
   `ehlo`, `starttls` (including certificate verification after STARTTLS), `auth`, `mail_from`,
-  `rcpt_to`, `data` (from the command until `CRLF.CRLF` is sent), `data_end` (waiting for the final
-  reply).
+  `rcpt_to`, `data` (from the command until the write of the final `CRLF.CRLF` is issued),
+  `data_end` (from that write on: waiting for the final reply, and after it until the HTTP response
+  is written, §5.4).
 
 ### 5.4 What a response settles, and what it does not
 
 The README says this explicitly. `[D22]`
 
-- `ok:false` without a `stage`, or with a `stage` earlier than `data_end`, means the message was
-  handed to nobody — whatever the code, `INTERNAL_ERROR` included.
-- `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR` or `INTERNAL_ERROR` with `stage:"data_end"` mean an
-  **unknown outcome** — the server may have accepted the message, and a retry may duplicate it.
+- **Handed to nobody:** `ok:false` without a `stage`; with a `stage` earlier than `data_end`,
+  whatever the code, `INTERNAL_ERROR` included; or with `stage:"data_end"` and a 4xx or 5xx reply
+  from the server (`UPSTREAM_TRANSIENT`, `UPSTREAM_REJECTED`) — the server answered, and its answer
+  was a refusal.
+- **Unknown outcome:** `stage:"data_end"` without a usable reply — `UPSTREAM_TIMEOUT`,
+  `UPSTREAM_ERROR` (a broken connection, a reply outside the expected course) or `INTERNAL_ERROR`.
+  The server may have accepted the message, and a retry may duplicate it.
 
-The stage becomes `data_end` when the write of the final `CRLF.CRLF` is issued (§5.6), and a
-failure at an earlier stage — an exception in the service included — closes the connection without
-that write. So an `INTERNAL_ERROR` at an earlier stage never followed a final dot.
+The two cases cover every `ok:false` response. They rest on two guarantees of the implementation:
+
+- The stage becomes `data_end` when the write of the final `CRLF.CRLF` is **issued** (§5.6), not
+  when a reply arrives, and a failure at an earlier stage — an exception in the service included —
+  closes the connection without that write. So an `INTERNAL_ERROR` at an earlier stage never
+  followed a final dot.
+- **A stage once reached stays in the envelope until the HTTP response is written.** After the
+  final 2xx the stage remains `data_end` (the set has nothing beyond it), so an exception raised
+  after the server accepted the message — while the response is built, for instance — is an
+  `INTERNAL_ERROR` with `stage:"data_end"` and `message_id`: an unknown outcome, never "handed to
+  nobody". The message did go out, but an `INTERNAL_ERROR` cannot say "success", and "unknown" is
+  the only truth on the safe side.
 
 This is the only SMTP ambiguity that a transport cannot remove, and the consumer must know it when
 deciding about a retry (§2). A consumer whose own HTTP timeout runs out meets the same boundary
@@ -820,10 +834,16 @@ appended.
     container with a read-only file system passes these tests.
 21. The envelope always: an unknown path → `NOT_FOUND`, a wrong method → `METHOD_NOT_ALLOWED`, a
     forced exception inside the handling → `INTERNAL_ERROR` with `dispatch_id`, all as JSON per
-    §5.3; an exception forced before composition → no `message_id`, no `upstream`; an exception
-    forced after composition, during the conversation → `message_id`, `size_bytes`,
-    `duration_ms` and `upstream.stage` of the stage reached, and the fake's record holds no final
-    dot.
+    §5.3. The forced exception is placed on both sides of the boundary of §5.4:
+    (a) before composition → no `message_id`, no `upstream`;
+    (b) after composition, during the conversation, before the final write → `message_id`,
+    `size_bytes`, `duration_ms` and `upstream.stage` of the stage reached, and the fake's record
+    holds no final dot;
+    (c) after the write of the final dot is issued, before the reply → `stage:"data_end"`,
+    `message_id` present, and the fake's record holds the final dot (the fake may then answer
+    `250` and record the message);
+    (d) after the final `250`, while the HTTP response is built → `stage:"data_end"`, `message_id`
+    present, and the message recorded on the fake's side.
 22. The HTTP client goes away (§5.6): (a) the fake stays silent at `RCPT TO` and the HTTP client
     closes its connection after a short time → the fake sees its socket closed and records no
     message, and the log has an "aborted by the client" event with `stage:"rcpt_to"`; (b) the fake
@@ -943,9 +963,12 @@ The README says explicitly, among the rest:
   one deadline for name resolution and every connection attempt together, addresses tried in the
   resolver's order; all failing within it is `UPSTREAM_UNREACHABLE`, running out of it is
   `UPSTREAM_TIMEOUT`.
-- **[D22] The unknown-outcome cases are named in the contract** — `UPSTREAM_TIMEOUT`,
-  `UPSTREAM_ERROR` or `INTERNAL_ERROR` at `data_end` — and the README states them. Any failure at an
-  earlier stage, or before the conversation, handed the message to nobody.
+- **[D22] The unknown-outcome cases are named in the contract** — `data_end` without a usable
+  reply: `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR` or `INTERNAL_ERROR` — and the README states them.
+  Everything else that is `ok:false` handed the message to nobody: a failure before the
+  conversation or at an earlier stage, and a 4xx or 5xx refusal at `data_end`. The stage turns
+  `data_end` when the final write is issued and stays there until the response is written, so an
+  exception after acceptance reads as unknown, never as "nobody".
 - **[D23] An authentication failure is 502, not 401.** It is the service's configuration, not the
   caller's fault.
 - **[D24] 503 carries no `Retry-After`.** SMTP does not say when to retry.
@@ -1006,7 +1029,8 @@ The README says explicitly, among the rest:
   backwards-compatible addition. An `INTERNAL_ERROR` carries the same fields for whatever had been
   reached — the composed message, the conversation and its stage — and leaves out, rather than
   nulls, what had not; an exception after the final dot is an unknown outcome too, and must not
-  leave the consumer without the identifier.
+  leave the consumer without the identifier. What was reached stays reached until the response is
+  written, so an exception after the final 2xx still carries `data_end` and the `Message-ID`.
 - **[D43] Health says why it is not `ok`**, in `upstream.error`, with the shape of the send
   envelope's `upstream`; the password never appears in it.
 - **[D44] The SMTP client is the service's own, on asyncio, not `smtplib`.** `smtplib` breaks the
