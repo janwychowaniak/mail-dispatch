@@ -1,8 +1,7 @@
 # mail-dispatch — functional specification
 
-**Status: DRAFT (2026-10-08), clarified; awaiting approval.**
-Once approved, this file is the source of truth for implementation and the authority on the
-contract. Design decisions are marked `[D#]` inline and recorded in
+**Status: APPROVED (2026-10-08).** This file is the source of truth for implementation and the
+authority on the contract. Design decisions are marked `[D#]` inline and recorded in
 [§13](#13-decision-record); defects are reported against those numbers.
 
 ## 1. Purpose
