@@ -8,6 +8,7 @@ permissions: { contents: read }
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10                 # fail fast if an apt mirror hangs (default is 6 h)
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 0 }        # full history for content scan + git log --all
