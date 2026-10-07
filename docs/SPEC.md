@@ -182,8 +182,9 @@ service **does not fabricate** a `To` header. The envelope sender (`MAIL FROM`) 
   parts get `charset=utf-8` from the service.
 - **Binary content** arrives as base64: the standard alphabet with padding. `CR`, `LF` and spaces
   (U+0020) are removed from anywhere before decoding; anything else, a tab included, is
-  `INVALID_CONTENT`. Non-zero padding bits (`QR==`) are accepted. Empty content (a 0-byte file) is
-  allowed.
+  `INVALID_CONTENT`. Padding is required: input whose length after that removal is not a multiple
+  of 4, or with `=` anywhere but at the end, is `INVALID_CONTENT`. Non-zero padding bits (`QR==`)
+  are accepted. Empty content (a 0-byte file) is allowed.
 
 ### 4.4 MIME structure and transfer encoding
 
@@ -252,6 +253,9 @@ order, then the structure's `Content-*` headers. `[D13]`
   (encoded-words, RFC 2231 continuations).
 - `Content-Disposition` and `Content-Type` fold **between parameters** first
   (`Content-Disposition: attachment;` ⏎ ` filename="…"`).
+- In a quoted string the service writes — an ASCII display name or `filename="…"` — a `"` is
+  written as the quoted pair `\"` (RFC 5322 / RFC 2045 `quoted-string`), and a `\` in a display
+  name as `\\`; the escaped form is what counts towards line length.
 - An ASCII file name is written as `filename="…"`. RFC 2231 continuations (`filename*0=`,
   `filename*1=`, …) are used only when that single parameter does not fit in 78 on its line. A
   common ASCII name of up to about 60 characters thus keeps the most widely understood form. A
@@ -283,7 +287,9 @@ ends the handling:
    request has no `Content-Length` → `INVALID_REQUEST` / `REQUEST_TOO_LARGE`;
 2. JSON validity and the strict shape (§4.1: types, unknown fields, no recipient, `inline` without
    `html`, Unicode) → `INVALID_REQUEST`;
-3. control characters (§4.6) → `INVALID_HEADER`;
+3. control characters (§4.6) → `INVALID_HEADER`; step 3 sees the raw value, and the
+   `White_Space` rule of §4.1 applies only to fields that passed it — the tab, VT, FF and NEL
+   belong to both sets, so a `name` of a single tab is `INVALID_HEADER`, not an absent name;
 4. field grammars: addresses → `INVALID_ADDRESS`, then duplicates (§4.2) → `INVALID_REQUEST`,
    custom headers → `INVALID_HEADER`, bodies and parts → `INVALID_CONTENT`;
 5. the total number of recipients (`MAX_RECIPIENTS`) → `TOO_MANY_RECIPIENTS`;
@@ -295,7 +301,8 @@ ends the handling:
    result of the conversation (§5). `[D19]`
 
 **Which error wins.** `[D36]` Steps are taken in the order above, and within step 4 the categories
-in the order given there. Between fields, a **fixed schema order** decides — the first failing
+in the order given there. Between fields of the same category, a **fixed schema order** decides
+— the first failing
 field in this order is reported:
 
 1. `from`, `to`, `cc`, `bcc`, `reply_to` (list by list, element by element, `address` before
@@ -370,9 +377,11 @@ The limit envelopes carry the threshold, the measured value and the source of th
 - Multi-line server replies are joined with `\n` without the codes, and decoded from UTF-8 with
   invalid bytes replaced; the code of a multi-line reply is taken from its last line.
 - **A reply outside the expected course** — 3xx to `MAIL FROM` or `RCPT TO`, 2xx to `DATA`
-  instead of 354, a 1xx, a code other than 334 in the middle of `AUTH LOGIN` — is `UPSTREAM_ERROR`
-  at the current stage. After a 2xx to `DATA` the content **is not sent** (the server would read
-  it as commands). A 3xx to `RCPT TO` fits none of `accepted`/`rejected`/`deferred`, so it ends the
+  instead of 354, a 1xx, and a 2xx or a 3xx other than 334 in the middle of `AUTH LOGIN` — is
+  `UPSTREAM_ERROR` at the current stage. A 4xx or 5xx at **any** step of `AUTH`, between the steps
+  of `LOGIN` included, keeps its meaning from the table of §5.5 (`UPSTREAM_TRANSIENT`,
+  `UPSTREAM_AUTH`). After a 2xx to `DATA` the content **is not sent** (the server would read it as
+  commands). A 3xx to `RCPT TO` fits none of `accepted`/`rejected`/`deferred`, so it ends the
   whole send: that reply goes to `upstream.code`/`message`, and the earlier replies to
   `recipients[]`. `[D39]`
 - After a failed conversation the service sends `QUIT` on a best-effort basis, with a short limit
@@ -400,6 +409,9 @@ The limit envelopes carry the threshold, the measured value and the source of th
            "recipients": [...]}}                                             // as on success, without the counters; see below
 ```
 
+"Conversation errors" are every `UPSTREAM_*` code, and an `INTERNAL_ERROR` raised once the message
+was composed (below).
+
 - `field` is a path in the request (`from.address`, `to[1].name`, `reply_to[0].address`,
   `inline[0].cid`, `attachments[2].filename`, `headers.X-Foo`, `subject`); `index` is present
   only for list elements. An unknown field is reported at its own path (`to[0].foo`), a missing
@@ -410,6 +422,11 @@ The limit envelopes carry the threshold, the measured value and the source of th
   The message is composed by then, and with an unknown outcome (§5.4) its `Message-ID` is the
   only way for the consumer to check whether it arrived after all; `duration_ms` (§5.1) tells
   how long the conversation lasted before it failed.
+- **An `INTERNAL_ERROR` envelope carries what was reached when the exception was raised**: once the
+  message was composed, `message_id` and `size_bytes`; once the conversation had started, also
+  `duration_ms` and `upstream` with the stage reached (`code: null`, a fixed descriptive
+  `message` — never the exception's own text), and `recipients[]` by the rule below. Fields that
+  were not reached are absent, never `null`. `[D42]`
 - `recipients[]` is present — possibly empty — **exactly when `stage` is `rcpt_to`, `data` or
   `data_end`**, and absent at earlier stages. It lists only the recipients that received a reply;
   a recipient the conversation did not reach is not listed. `recipients[].status` describes **only
@@ -430,9 +447,14 @@ The limit envelopes carry the threshold, the measured value and the source of th
 
 The README says this explicitly. `[D22]`
 
-- `ok:false` with a `stage` earlier than `data_end` means the message was handed to nobody.
-- `UPSTREAM_TIMEOUT` or `UPSTREAM_ERROR` with `stage:"data_end"`, and `INTERNAL_ERROR`, mean an
+- `ok:false` without a `stage`, or with a `stage` earlier than `data_end`, means the message was
+  handed to nobody — whatever the code, `INTERNAL_ERROR` included.
+- `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR` or `INTERNAL_ERROR` with `stage:"data_end"` mean an
   **unknown outcome** — the server may have accepted the message, and a retry may duplicate it.
+
+The stage becomes `data_end` when the write of the final `CRLF.CRLF` is issued (§5.6), and a
+failure at an earlier stage — an exception in the service included — closes the connection without
+that write. So an `INTERNAL_ERROR` at an earlier stage never followed a final dot.
 
 This is the only SMTP ambiguity that a transport cannot remove, and the consumer must know it when
 deciding about a retry (§2). A consumer whose own HTTP timeout runs out meets the same boundary
@@ -662,15 +684,16 @@ such as `5.1.1`, when there is one) and the counters — and the duration. They 
 content, the subject, the attachments, the full recipient lists, the password, or **the text of a
 server reply**: SMTP replies often quote a recipient's address (`550 5.1.1 <…>: user unknown`).
 The reply text goes only to the HTTP response. `[D30]` A send aborted because the HTTP client went
-away is logged as an outcome of its own, with its stage (§5.6).
+away is logged as an outcome of its own, with its stage (§5.6). The event of an `INTERNAL_ERROR`
+names the stage reached.
 
 ## 10. Testing contract
 
 ### 10.1 Harness
 
-- Tests use a **fake SMTP server inside the test process** — a server library or an own scripted
-  fake, because the greeting, silence and connection-break tests need control over every reply —
-  which records the envelopes and raw messages it receives.
+- Tests use a **fake SMTP server inside the test process** — a server library or a scripted fake
+  of its own, because the greeting, silence and connection-break tests need control over every
+  reply — which records the envelopes and raw messages it receives.
 - No test needs a real server or the network. Name resolution is substituted in tests, so "a name
   that does not resolve" never reaches DNS.
 - The fake can answer any code at any stage, a multi-line greeting included; announce or not
@@ -735,9 +758,10 @@ appended.
    → `INVALID_REQUEST` pointing at the second occurrence; no recipient, neither `text` nor `html`,
    `inline` without `html`, `from` without `address`, an unknown field, a repeated JSON key, a lone
    surrogate → `INVALID_REQUEST`.
-9. `content_base64` that cannot be decoded, a duplicate `cid`, `content_type: "multipart/mixed"`
-   and `"message/rfc822"`, a file name containing `/` or `\`, a file name equal to `..` →
-   `INVALID_CONTENT`; a file name that merely contains `..` (`report..pdf`) → accepted.
+9. `content_base64` that cannot be decoded, `content_base64` without its padding, a duplicate
+   `cid`, `content_type: "multipart/mixed"` and `"message/rfc822"`, a file name containing `/` or
+   `\`, a file name equal to `..` → `INVALID_CONTENT`; a file name that merely contains `..`
+   (`report..pdf`) → accepted.
 10. Limits: a request over `MAX_REQUEST_BYTES` (also without `Content-Length`; a wrong
     `Content-Type` with a body over the limit → `INVALID_REQUEST`, because the type is checked
     first) and a message over `MAX_MESSAGE_BYTES` → the right code with
@@ -775,7 +799,9 @@ appended.
 17. Authentication configured, the fake announces `AUTH` only after STARTTLS → success (the service
     reads the `EHLO` after STARTTLS); a fake with `PLAIN` and `LOGIN` → `PLAIN` used; a fake without
     `AUTH` → `UPSTREAM_AUTH` with `stage:"auth"` and `code:null`; a wrong password → `UPSTREAM_AUTH`
-    after one attempt, the password absent from the logs and from the response; credentials in
+    after one attempt, the password absent from the logs and from the response; a fake offering
+    only `LOGIN` that answers `535` right after the user-name step → `UPSTREAM_AUTH` with
+    `stage:"auth"` and no second attempt; credentials in
     `starttls-opportunistic` mode without TLS → `UPSTREAM_TLS` and **no** `AUTH` in the fake's
     record; `SMTP_TLS=none` with credentials → the service does not start.
 18. Health: two calls within the TTL → **one** probe; a fake announcing `SIZE` and `AUTH` after
@@ -787,14 +813,17 @@ appended.
 19. Determinism: the same request twice → identical MIME structure, headers, their order,
     encodings and content; only `Date`, `Message-ID` and the boundaries differ; the two
     `Message-ID`s differ.
-20. "No traffic other than to the server": during cases 1–19 the only outgoing connections go to
-    the fake, and the only name queries concern its name (a substituted resolver and a patch on
-    socket opening). "Nothing written to disk": during cases 1–19 a patch on opening files for
-    writing records no write outside the harness's temporary directory, and the service in a
+20. "No traffic other than to the server": during every other case the only outgoing connections
+    go to the fake, and the only name queries concern its name (a substituted resolver and a patch
+    on socket opening). "Nothing written to disk": during every other case a patch on opening files
+    for writing records no write outside the harness's temporary directory, and the service in a
     container with a read-only file system passes these tests.
 21. The envelope always: an unknown path → `NOT_FOUND`, a wrong method → `METHOD_NOT_ALLOWED`, a
     forced exception inside the handling → `INTERNAL_ERROR` with `dispatch_id`, all as JSON per
-    §5.3.
+    §5.3; an exception forced before composition → no `message_id`, no `upstream`; an exception
+    forced after composition, during the conversation → `message_id`, `size_bytes`,
+    `duration_ms` and `upstream.stage` of the stage reached, and the fake's record holds no final
+    dot.
 22. The HTTP client goes away (§5.6): (a) the fake stays silent at `RCPT TO` and the HTTP client
     closes its connection after a short time → the fake sees its socket closed and records no
     message, and the log has an "aborted by the client" event with `stage:"rcpt_to"`; (b) the fake
@@ -914,8 +943,9 @@ The README says explicitly, among the rest:
   one deadline for name resolution and every connection attempt together, addresses tried in the
   resolver's order; all failing within it is `UPSTREAM_UNREACHABLE`, running out of it is
   `UPSTREAM_TIMEOUT`.
-- **[D22] The unknown-outcome cases are named in the contract** (`data_end` timeout or error,
-  `INTERNAL_ERROR`), and the README states them.
+- **[D22] The unknown-outcome cases are named in the contract** — `UPSTREAM_TIMEOUT`,
+  `UPSTREAM_ERROR` or `INTERNAL_ERROR` at `data_end` — and the README states them. Any failure at an
+  earlier stage, or before the conversation, handed the message to nobody.
 - **[D23] An authentication failure is 502, not 401.** It is the service's configuration, not the
   caller's fault.
 - **[D24] 503 carries no `Retry-After`.** SMTP does not say when to retry.
@@ -962,7 +992,9 @@ The README says explicitly, among the rest:
   status set has no "not attempted".
 - **[D39] A reply outside the expected course is `UPSTREAM_ERROR` at the current stage.** After a
   2xx to `DATA` the content is not sent, because the server would read it as commands; a 3xx to
-  `RCPT TO` ends the send, since it fits none of the recipient statuses.
+  `RCPT TO` ends the send, since it fits none of the recipient statuses. In `AUTH LOGIN` only a 2xx
+  or a 3xx other than 334 is out of course; a 4xx or 5xx at any step keeps the meaning of the
+  table, so a `535` after the user name is `UPSTREAM_AUTH`, exactly like one after the password.
 - **[D40] `SMTP_EHLO_NAME` is an RFC 5321 `Domain`, and the all-digits rule for the last label of
   an address domain does not apply to it.** A default container hostname is all digits about once in
   300 starts, and the image must not fail to start at random. `MESSAGE_ID_DOMAIN` keeps the address
@@ -971,7 +1003,10 @@ The README says explicitly, among the rest:
   after `DATA` against how long the consumer's HTTP connection is held.
 - **[D42] Every `UPSTREAM_*` envelope carries `message_id`, `size_bytes` and `duration_ms`.** With an
   unknown outcome the `Message-ID` is the only way to check whether the message arrived; a
-  backwards-compatible addition.
+  backwards-compatible addition. An `INTERNAL_ERROR` carries the same fields for whatever had been
+  reached — the composed message, the conversation and its stage — and leaves out, rather than
+  nulls, what had not; an exception after the final dot is an unknown outcome too, and must not
+  leave the consumer without the identifier.
 - **[D43] Health says why it is not `ok`**, in `upstream.error`, with the shape of the send
   envelope's `upstream`; the password never appears in it.
 - **[D44] The SMTP client is the service's own, on asyncio, not `smtplib`.** `smtplib` breaks the
