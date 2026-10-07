@@ -218,3 +218,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# --------------- Environments ---------------
+
+.env
+.envrc
+.env.local
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+
+# --------------- AI -------------------------
+
+# Aider (the same pattern aider adds itself; also catches .aiderignore)
+.aider*
+
+# Claude Code - personal files only; logs and sessions live in ~/.claude/
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+
+# OpenCode - sessions live in ~/.local/share/opencode/; .opencode/ is shareable config
+# Codex CLI - sessions live in ~/.codex/; .codex/ is shareable config (config.toml, skills/)
+# Cursor - nothing needed; .cursorignore and .cursor/rules/ are safe to commit
