@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Block commits whose MESSAGE contains a secret ($1 = message file).
+# Content scans never see the message, so it is scanned as plain text.
+command -v gitleaks >/dev/null 2>&1 || { echo "⚠️  gitleaks not installed — skipping" >&2; exit 0; }
+# --config is required: config autodetection follows --source (a file under .git/),
+# not the cwd, so without it only the default rules would apply.
+gitleaks detect --no-git --source "$1" --config .gitleaks.toml --redact -v || {   # v8.19+: gitleaks dir
+  echo "❌ gitleaks: secret in the commit MESSAGE — commit blocked" >&2; exit 1; }

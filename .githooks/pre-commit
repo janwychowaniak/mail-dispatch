@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Block commits whose staged changes contain a secret.
+command -v gitleaks >/dev/null 2>&1 || { echo "⚠️  gitleaks not installed — skipping" >&2; exit 0; }
+gitleaks protect --staged --redact -v || {        # v8.19+ equivalent: gitleaks git --staged
+  echo "❌ gitleaks: secret in staged changes — commit blocked" >&2; exit 1; }

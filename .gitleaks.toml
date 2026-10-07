@@ -1,0 +1,35 @@
+title = "mail-dispatch gitleaks config"
+
+[extend]
+useDefault = true                    # keep the full built-in ruleset
+
+[allowlist]                          # gitleaks v8.25+ also accepts [[allowlists]]
+description = "false positives"
+paths = ['''\.gitleaks\.toml''']     # skip this file (it carries rule regexes)
+# regexes = ['''YOUR_[A-Z_]*_(KEY|TOKEN)''']   # add real false positives here as they appear
+
+# --- Add-on rules: they only ADD coverage, never replace -----------------------
+# useDefault = true keeps every built-in rule; these are appended on top. Each id is
+# unique and prefixed (jw-), so no built-in rule is overridden or disabled.
+#
+# The built-in generic-api-key rule is the only net for prefix-less secrets, and its
+# own stopword allowlist silently disables it based on the secret's value (e.g. every
+# "sk-ant-..." key contains "ant"). Prefix-anchored rules fire regardless, so add one
+# for every credential format this project actually uses.
+#
+# Keyword hygiene: a keyword that also occurs in ordinary text suppresses
+# generic-api-key on the same line, even when the rule's regex does not match.
+# Keep keywords specific to the credential and validate every change against a
+# corpus of fake keys before committing it.
+
+[[rules]]
+id = "jw-openrouter-key"
+description = "OpenRouter API key (sk-or-v1-)"
+regex = '''sk-or-v1-[0-9a-f]{64}'''
+keywords = ["sk-or-v1-"]
+
+[[rules]]
+id = "jw-anthropic-key"
+description = "Anthropic API key (sk-ant-)"
+regex = '''\bsk-ant-[A-Za-z0-9]{2,12}-[A-Za-z0-9_-]{80,120}\b'''
+keywords = ["sk-ant-"]               # loose middle segment survives api03 -> admin01 etc.

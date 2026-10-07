@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Block pushes whose new commits contain a secret, in content or in messages.
+# stdin: "<local_ref> <local_sha> <remote_ref> <remote_sha>" per pushed ref.
+command -v gitleaks >/dev/null 2>&1 || { echo "⚠️  gitleaks not installed — skipping" >&2; exit 0; }
+z=0000000000000000000000000000000000000000; fail=0
+tmp=$(mktemp -d) || exit 0; trap 'rm -rf "$tmp"' EXIT
+while read -r _ local_sha _ remote_sha; do
+  [ "$local_sha" = "$z" ] && continue                       # deleting a ref
+  if [ "$remote_sha" = "$z" ]; then set -- "$local_sha" --not --remotes   # new branch
+  else set -- "$remote_sha..$local_sha"; fi                 # existing branch: new commits only
+  gitleaks detect --log-opts="$*" --redact -v || fail=1     # v8.19+: gitleaks git --log-opts=...
+  git log --format=%B "$@" > "$tmp/m" 2>/dev/null
+  [ -s "$tmp/m" ] && { gitleaks detect --no-git --source "$tmp/m" --config .gitleaks.toml --redact -v || fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "❌ push blocked (see finding above)" >&2; exit 1; }
