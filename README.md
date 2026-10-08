@@ -335,7 +335,20 @@ git config core.hooksPath .githooks
 The `/v1` path is part of the contract. Adding a field is backwards-compatible; changing a
 field's meaning or a closed set of values (`status`, `stage`, `code`, …) requires `/v2`
 `[D31]`. Images are published as `ghcr.io/janwychowaniak/mail-dispatch:<version>`; `latest` is
-not a contract.
+not a contract. [`CHANGELOG.md`](CHANGELOG.md) records each version's notes, its digest and its
+Image Id.
+
+Each release also carries the image as a file, for hosts that cannot reach the registry:
+`mail-dispatch-<version>.tar.gz` and its `.sha256`.
+
+```sh
+sha256sum -c mail-dispatch-0.1.0.tar.gz.sha256
+docker load --input mail-dispatch-0.1.0.tar.gz
+docker image inspect --format '{{.Id}}' ghcr.io/janwychowaniak/mail-dispatch:0.1.0
+```
+
+The Id must equal the one in `CHANGELOG.md`. It is the same after a pull and after a load,
+while the registry's digest does not survive the transfer.
 
 ## License
 

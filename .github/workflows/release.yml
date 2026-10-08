@@ -1,0 +1,167 @@
+name: release
+
+# Publishes the image on an annotated version tag (SPEC §12). `latest` moves too, but it is not a
+# contract - the version tag is (§11).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/mail-dispatch
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image-id: ${{ steps.push.outputs.image-id }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # mail_dispatch.__version__ follows pyproject.version, which tests/test_version.py checks.
+      - name: The tag and pyproject.version must agree
+        run: |
+          python3 - <<'PY'
+          import os, sys, tomllib, pathlib
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          if tag != f"v{version}":
+              print(f"::error::tag {tag} does not match pyproject version {version}")
+              sys.exit(1)
+          print(f"tag {tag} matches pyproject version {version}")
+          PY
+
+      - name: The suite has to pass on the exact commit being published
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest -q --cov --cov-fail-under=90
+
+      # The base image is rebuilt under its tag, so this build may carry a newer Python or newer
+      # Debian packages than the ones CI tested [D45]. The test stage is built first and pulls the
+      # base; the release image is then built on that same base from the cache, so the suite
+      # runs, read-only and with no network [D46], on what is about to be pushed.
+      - name: The suite passes on the base being published
+        run: |
+          DOCKER_BUILDKIT=0 docker build --target test -t mail-dispatch:test .
+          docker run --rm --read-only --tmpfs /tmp --network none mail-dispatch:test
+
+      - name: Build
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DOCKER_BUILDKIT=0 docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+
+      - name: The image serves read-only before it is pushed
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker run -d --name md --read-only -p 127.0.0.1:8000:8000 \
+            -e SMTP_HOST=smtp.invalid -e HEALTH_PROBE_TIMEOUT_SECONDS=2 "$IMAGE:$VERSION"
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/v1/health >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/v1/health | tee /tmp/health.json
+          python3 -c "import json; h = json.load(open('/tmp/health.json')); assert h['ok'] is False and h['upstream']['status'] == 'down' and h['version'] == '$VERSION', h"
+          docker rm -f md
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")"
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$IMAGE:$VERSION")"
+          PYTHON="$(docker run --rm "$IMAGE:$VERSION" python -c 'import platform; print(platform.python_version())')"
+          echo "digest=${DIGEST#*@}" >> "$GITHUB_OUTPUT"
+          echo "image-id=$IMAGE_ID" >> "$GITHUB_OUTPUT"
+          {
+            echo "- digest: \`${DIGEST#*@}\`"
+            echo "- image Id: \`$IMAGE_ID\`"
+            echo "- Python: $PYTHON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The release files: the published image as an archive, for a host that cannot reach the
+  # registry, and its checksum (§12). This is the only job that may write to the repository, and
+  # it runs after the push, so a failure here leaves the published image as it is: "Re-run failed
+  # jobs" repeats this job alone, and nothing is built or pushed a second time.
+  archive:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: read
+    env:
+      DIGEST: ${{ needs.publish.outputs.digest }}
+      IMAGE_ID: ${{ needs.publish.outputs.image-id }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pulled by digest, so the archive holds exactly what was published, under its full name.
+      - name: Save the published image, and load it back into an empty store
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker pull "$IMAGE@$DIGEST"
+          docker tag "$IMAGE@$DIGEST" "$IMAGE:$VERSION"
+          .github/scripts/archive-image.sh "$IMAGE" "$VERSION" "$IMAGE_ID"
+          echo "- archive: \`$(cat "mail-dispatch-$VERSION.tar.gz.sha256")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # The checkout stores the commit the tag points at under the tag's name: a lightweight tag,
+      # whose contents are the commit message, and --notes-from-tag would read exactly that. The
+      # tag is fetched as it was pushed, and a lightweight one stops the release here.
+      - name: Fetch the tag as it was pushed
+        run: |
+          git fetch --no-tags --depth=1 --force origin \
+            "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" != tag ]; then
+            echo "::error::$GITHUB_REF_NAME is not an annotated tag, so it carries no release notes"
+            exit 1
+          fi
+
+      - name: Attach the archive to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          FILES=("mail-dispatch-$VERSION.tar.gz" "mail-dispatch-$VERSION.tar.gz.sha256")
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${FILES[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${FILES[@]}" \
+              --verify-tag --notes-from-tag --title "$GITHUB_REF_NAME"
+          fi
+
+      # Checked on what was published rather than on what was sent, so a cause nobody has met yet
+      # turns the job red as well. Trailing newlines are not part of the comparison.
+      - name: The release notes are the tag message
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG_NOTES="$(git tag --list "$GITHUB_REF_NAME" --format='%(contents)')"
+          RELEASE_NOTES="$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)"
+          if [ -z "$TAG_NOTES" ] || [ "$TAG_NOTES" != "$RELEASE_NOTES" ]; then
+            echo "::error::the notes of release $GITHUB_REF_NAME are not its tag message"
+            diff <(printf '%s\n' "$TAG_NOTES") <(printf '%s\n' "$RELEASE_NOTES") | head -20 || true
+            exit 1
+          fi

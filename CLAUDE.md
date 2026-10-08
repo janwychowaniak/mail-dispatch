@@ -83,18 +83,34 @@ and confirm it goes red.
 
 ## Release
 
-Rules from §12, in force from the first tag (`0.1.0`). The release workflow is not written
-yet; it comes before the first tag, modelled on mail-dissect's:
+Rules from §12, in force from the first tag (`0.1.0`). `.github/workflows/release.yml`, modelled
+on mail-dissect's, runs on an **annotated** `v*` tag:
 
-- an **annotated** `v*` tag equal to `pyproject.version` (and `mail_dispatch.__version__`, which
-  a test keeps in step);
-- the workflow publishes `ghcr.io/janwychowaniak/mail-dispatch:<version>` for amd64; `latest`
-  is not a contract;
-- a separate job attaches the image archive (`docker save` by the full tag, `.tar.gz` +
-  `.sha256`) to the release, for hosts without access to the registry;
-- `CHANGELOG.md` records the image digest and its Id;
-- **a tag is never pushed again**, not even to fix its message — that can publish the same
-  version under another digest. A wrong line is corrected in `CHANGELOG.md` as an erratum.
+- the tag must equal `pyproject.version` (and `mail_dispatch.__version__`, which a test keeps in
+  step), or nothing is published;
+- the suite runs on the commit, and again in the `test` stage built on the same base as the
+  release image, read-only and with no network, because the base moves under its tag [D45];
+- the image serves read-only before it is pushed; then
+  `ghcr.io/janwychowaniak/mail-dispatch:<version>` and `latest` are pushed for amd64; `latest` is
+  not a contract. The job summary carries the digest, the Image Id and the Python of the image;
+- the `archive` job pulls what was pushed by its digest, saves it by the full tag, loads it back
+  into a store that no longer holds it and compares the Id (`.github/scripts/archive-image.sh`),
+  then attaches `.tar.gz` + `.sha256` to the release, whose notes must equal the tag message. It is
+  the only job with `contents: write`, and it runs after the push: **when it fails, re-run that
+  job alone** — re-running the whole workflow builds and pushes again.
+
+**Every release, in this order:** the notes go into `CHANGELOG.md` and are read against what they
+claim before the tag exists; CI is green on the commit the tag points at; the tag is created
+with the notes as its message (`git tag -a vX.Y.Z -F notes`) — **git's default clean-up strips
+every line that starts with `#`, so the notes carry no Markdown headings**; after the workflow,
+the digest is read from its summary and from a pull of the tag, the Image Id from its summary
+and from loading the release's own archive, and both go into `CHANGELOG.md` with the Python the
+image runs, in a follow-up commit. A step that runs only on a tag is run by no CI before it: a
+change to the release workflow is checked locally as far as it goes, then by reading its log at
+the next release.
+
+**A tag is never pushed again**, not even to fix its message — that can publish the same version
+under another digest. A wrong line is corrected in `CHANGELOG.md` as an erratum.
 
 ## Key decisions
 
