@@ -37,7 +37,9 @@ it can be decided properly.
 a fake SMTP server that keeps every message it accepts and shows them in a browser. Mailpit
 speaks STARTTLS with a certificate it generates for itself and accepts any credentials, so the
 trial uses STARTTLS and authentication as a real server would, with certificate verification
-switched off.
+switched off. It publishes the service on `127.0.0.1:25587` and Mailpit's UI on
+`127.0.0.1:25588`, host ports that no common service takes by default; inside their containers
+both keep their usual ports (8000 and 8025).
 
 ```sh
 docker compose up --build
@@ -46,7 +48,7 @@ docker compose up --build
 Send a message:
 
 ```sh
-curl -sS http://127.0.0.1:8000/v1/send \
+curl -sS http://127.0.0.1:25587/v1/send \
   -H 'Content-Type: application/json' \
   -d '{
     "from": {"address": "sender@example.org", "name": "Sender"},
@@ -59,13 +61,13 @@ curl -sS http://127.0.0.1:8000/v1/send \
   }'
 ```
 
-Then open <http://127.0.0.1:8025> to read it. Mailpit lists `archive@example.org` as a Bcc
+Then open <http://127.0.0.1:25588> to read it. Mailpit lists `archive@example.org` as a Bcc
 recipient because it records the envelope; the message itself carries no `Bcc` header.
 
 Check the service and the server:
 
 ```sh
-curl -sS http://127.0.0.1:8000/v1/health
+curl -sS http://127.0.0.1:25587/v1/health
 ```
 
 ## The API
