@@ -11,6 +11,13 @@ erratum that says what the tag claims and what is true.
 
 ## 0.1.0 — 2026-10-08
 
+`ghcr.io/janwychowaniak/mail-dispatch@sha256:97885c180a3b7fb3ea0d40b2fd4e11bf0613f4c5502a94490a7c36a512338b9d`
+
+Image Id `sha256:fc22e0f5c7022e3436d8745331173b8c030ef3940bee6774b43be7c7b9b3835a`, after a pull
+and after `docker load` of the release file alike. Python 3.13.16. The digest was read from the
+workflow's push and from a pull of the tag; the image can be pulled without logging in. The
+release workflow ran for the first time with this tag, and every step of both jobs passed.
+
 The first release of the contract in `docs/SPEC.md`: one email message described in JSON,
 composed into an RFC 5322 / MIME message and sent through one configured SMTP server, with a
 report of the conversation recipient by recipient. A transport and nothing more: no templates,
