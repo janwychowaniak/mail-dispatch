@@ -22,6 +22,7 @@ from builders import request
 from certs import SERVER_NAME
 from conftest import ServiceFactory, substituted_resolver
 from fakesmtp import SILENT, Delayed, FakeSMTP
+from mailparse import assert_wire_format, parse, text_of
 
 from mail_dispatch import conversation, dispatch
 from mail_dispatch.app import create_app
@@ -30,6 +31,15 @@ from mail_dispatch.settings import Settings
 
 class Forced(RuntimeError):
     pass
+
+
+def assert_the_message(raw: bytes | None) -> None:
+    """What the fake received is the whole message of `request()`, read independently (§10.1)."""
+    assert raw is not None
+    assert_wire_format(raw)
+    message = parse(raw)
+    assert message["Subject"] == "Hello"
+    assert text_of(message) == "Hello, world."
 
 
 def internal_error(service: ServiceFactory) -> dict[str, Any]:
@@ -103,7 +113,8 @@ def test_case_21c_after_the_final_write_before_the_reply(
     error = internal_error(service)
     assert error["upstream"]["stage"] == "data_end"
     assert error["message_id"].startswith("<")
-    assert fake.wait_until(lambda: fake.last.final_dot)
+    assert fake.wait_until(lambda: fake.last.final_dot and fake.last.data is not None)
+    assert_the_message(fake.last.data)
 
 
 def test_case_21d_after_the_final_reply(
@@ -122,6 +133,7 @@ def test_case_21d_after_the_final_reply(
     assert error["message_id"].startswith("<")
     assert [r["status"] for r in error["recipients"]] == ["accepted"]
     assert fake.wait_until(lambda: bool(fake.messages))
+    assert_the_message(fake.messages[-1])
     (event,) = [r for r in caplog.records if r.name == "mail_dispatch"]
     assert event.levelno == logging.ERROR
     assert event.fields["stage"] == "data_end"  # type: ignore[attr-defined]
@@ -218,6 +230,7 @@ def test_case_22b_client_gone_after_the_final_write(
         # Nothing can be taken back: the reply is awaited, and the message is recorded.
         assert fake.wait_until(lambda: bool(fake.messages), timeout=5)
         assert wait_for(lambda: send_events(caplog))
+    assert_the_message(fake.messages[-1])
     (event,) = send_events(caplog)
     assert event["result"] == "sent"
     assert event["stage"] == "data_end"

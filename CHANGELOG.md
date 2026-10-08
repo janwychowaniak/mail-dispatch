@@ -25,10 +25,10 @@ serves on a read-only file system with no writable mount at all.
 Tried end to end against Mailpit v1.31.4 with STARTTLS required and authentication, through the
 `compose.yml` of this repository.
 
-The image runs on `python:3.13-slim-trixie` (Debian 13) as uid 10001, for amd64 on baseline
-x86-64. Pull it from GHCR, or, on a host that cannot reach the registry, take the archive
-attached to this release: check it with `sha256sum -c`, `docker load` it, and compare its Id with
-the one recorded in `CHANGELOG.md`.
+The image is built on `python:3.13-slim-trixie` (Debian 13) for amd64 on baseline x86-64, and
+runs as uid 10001. Pull it from GHCR, or, on a host that cannot reach the registry, take the
+archive attached to this release: check it with `sha256sum -c`, `docker load` it, and compare
+its Id with the one recorded in `CHANGELOG.md`.
 
 0.1.0 rather than 1.0.0 on purpose: the `/v1` path already carries the stability promise, and
 the contract has not yet been accepted by its consumer on a published image.
