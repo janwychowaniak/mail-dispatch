@@ -33,3 +33,15 @@ id = "jw-anthropic-key"
 description = "Anthropic API key (sk-ant-)"
 regex = '''\bsk-ant-[A-Za-z0-9]{2,12}-[A-Za-z0-9_-]{80,120}\b'''
 keywords = ["sk-ant-"]               # loose middle segment survives api03 -> admin01 etc.
+
+# Context-anchored: an SMTP password has no shape of its own, so the rule anchors on
+# the variable that carries it (SPEC §7.1). It catches a value in .env files, compose
+# environment maps and lists, `docker run -e`, JSON and commit messages, including the
+# human and app passwords that generic-api-key misses. SMTP_PASSWORD_FILE, an empty or
+# interpolated (`$...`) value, and a value under 4 characters stay silent.
+[[rules]]
+id = "jw-smtp-password"
+description = "SMTP password in the SMTP_PASSWORD variable"
+regex = '''SMTP_PASSWORD["']?[ \t]*[:=][ \t]*["']?([^\s"'$][^\s"']{3,})'''
+secretGroup = 1
+keywords = ["smtp_password"]
