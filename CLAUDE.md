@@ -62,7 +62,7 @@ uv run pytest -q --cov --cov-fail-under=90   # what CI gates on
 DOCKER_BUILDKIT=0 docker build -t mail-dispatch:dev .           # the release image
 DOCKER_BUILDKIT=0 docker build --target test -t mail-dispatch:test .
 docker run --rm --read-only --tmpfs /tmp --network none mail-dispatch:test
-docker compose up --build                     # local trial against Mailpit
+docker compose up --build   # local trial: service on 127.0.0.1:25587, Mailpit UI on :25588
 ```
 
 The Dockerfile must stay buildable with the classic builder — no `RUN --mount`, no heredocs,
@@ -71,15 +71,22 @@ no `COPY --link` — and CI enforces it with `DOCKER_BUILDKIT=0`. Every stage is
 
 Activate the secret-scanning hooks once per clone: `git config core.hooksPath .githooks`.
 Scanning runs in four layers — the three hooks in `.githooks/` and
-`.github/workflows/gitleaks.yml`, the only one that cannot be bypassed.
+`.github/workflows/gitleaks.yml`, the only one that cannot be bypassed. `.gitleaks.toml` adds
+`jw-smtp-password`, anchored on the variable name; it stays silent, by decision, for a value
+under 4 characters or one that starts with `$` (interpolation). Every change to the config is
+validated against a corpus of fake keys, one per file: no file may lose its finding. **The
+config is never weakened to get past a finding** — the value that tripped it is changed instead.
 
 **Tests.** The fake SMTP server (`tests/fakesmtp.py`) lives inside the test process and can
 answer anything at any stage, or stay silent (§10.1). Two autouse guards in `conftest.py` fail
 any test that connects anywhere but loopback or writes outside the temporary directory
-(case 20). `docs/spec-coverage.md` maps every acceptance case to its tests; keep it current. Every case in which a message reached the fake ends with an
-assertion on the raw message, parsed independently with the standard library — not only on the
-HTTP response. **Every assertion must be able to fail**: break the behaviour a test describes
-and confirm it goes red.
+(case 20). `docs/spec-coverage.md` maps every acceptance case to its tests; keep it current.
+Every case in which a message reached the fake ends with an assertion on the raw message,
+parsed independently with the standard library — not only on the HTTP response. **Every
+assertion must be able to fail**: break the behaviour a test describes and confirm it goes red.
+Tests pass a password through `monkeypatch.setenv(...)` or `smtp_password=`: a literal
+`SMTP_PASSWORD: "…"` or `SMTP_PASSWORD=…` of 4 characters or more is a `jw-smtp-password`
+finding, and the hooks refuse the commit.
 
 ## Release
 
@@ -127,6 +134,8 @@ The full record is `docs/SPEC.md` §13. The ones most likely to be "improved" by
   `Message-ID` and boundaries vary.
 - **[D16]** control characters are checked before any grammar and always give `INVALID_HEADER`.
 - **[D36]** the first error in the fixed schema order of §4.7 wins; the same invalid request
-  always gets the same error.
+  always gets the same error. A check belongs to the category of the field it examines, not of
+  the code it returns: the length of a `cid` or a `content_type` parameter is checked with its
+  part, and still gives `INVALID_HEADER`.
 - **[D40]** `SMTP_EHLO_NAME` is a `Domain` without the all-digits rule; a default container
   hostname must never fail startup at random.
