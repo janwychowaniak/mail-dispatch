@@ -295,6 +295,12 @@ secrets:
 - `SMTP_TIMEOUT_SECONDS` is a trade-off `[D41]`: servers may take a long time after `DATA`
   while they scan the content, and a short limit makes an unknown outcome more likely; a long
   one holds your HTTP connection open longer.
+- The size limits are not the size of an attachment. An attachment travels as base64 with a
+  line break every 76 characters, about 37% larger than the file (× 4/3 × 78/76), so with the
+  default 25 MiB message the largest single attachment is about 18 MiB. For attachments of
+  N MiB, set `MAX_MESSAGE_BYTES` to about 1.4 × N MiB plus the rest of the message, and
+  `MAX_REQUEST_BYTES` at least as high: the request carries the same base64 without the line
+  breaks.
 
 ## Development
 
