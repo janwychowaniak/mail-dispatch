@@ -1,0 +1,48 @@
+# Local trials: mail-dispatch in front of Mailpit, a fake SMTP server that keeps every message
+# it accepts and shows them at http://127.0.0.1:8025. Not a dependency of the project or of
+# its tests (SPEC §10.1).
+#
+#   docker compose up --build
+#   curl -sS http://127.0.0.1:8000/v1/health
+#
+# Mailpit speaks STARTTLS with a certificate it generates for itself and accepts any
+# credentials, so the service uses STARTTLS and AUTH as it would against a real server, with
+# verification switched off because nothing can vouch for that certificate. Against a real
+# server, keep SMTP_TLS_VERIFY on.
+services:
+  mail-dispatch:
+    build: .
+    image: mail-dispatch:dev
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_TLS: starttls
+      SMTP_TLS_VERIFY: "false"
+      SMTP_USERNAME: trial
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_EHLO_NAME: dispatch.example.org
+    secrets:
+      - smtp_password
+    # Published on loopback only, for the curl examples. In production publish nothing:
+    # consumers reach the service over the container network (SPEC §2).
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    # A margin over SMTP_TIMEOUT_SECONDS (60), so a send in progress can finish (§7.3).
+    stop_grace_period: 75s
+    depends_on:
+      - mailpit
+
+  mailpit:
+    image: axllent/mailpit:v1.31.4
+    command:
+      - --smtp-tls-cert=sans:mailpit
+      - --smtp-tls-key=sans:mailpit
+      - --smtp-require-starttls
+      - --smtp-auth-accept-any
+    ports:
+      - "127.0.0.1:8025:8025"
+
+secrets:
+  smtp_password:
+    file: ./compose.password.example
