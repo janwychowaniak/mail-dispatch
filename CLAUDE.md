@@ -59,22 +59,32 @@ uv sync --frozen
 uv run ruff check . && uv run ruff format --check .
 uv run mypy --strict src
 uv run pytest -q --cov --cov-fail-under=90   # what CI gates on
+DOCKER_BUILDKIT=0 docker build -t mail-dispatch:dev .           # the release image
+DOCKER_BUILDKIT=0 docker build --target test -t mail-dispatch:test .
+docker run --rm --read-only --tmpfs /tmp --network none mail-dispatch:test
+docker compose up --build                     # local trial against Mailpit
 ```
+
+The Dockerfile must stay buildable with the classic builder — no `RUN --mount`, no heredocs,
+no `COPY --link` — and CI enforces it with `DOCKER_BUILDKIT=0`. Every stage is on
+`python:3.13-slim-trixie` [D45].
 
 Activate the secret-scanning hooks once per clone: `git config core.hooksPath .githooks`.
 Scanning runs in four layers — the three hooks in `.githooks/` and
 `.github/workflows/gitleaks.yml`, the only one that cannot be bypassed.
 
-**Tests.** The fake SMTP server lives inside the test process and can answer anything at any
-stage, or stay silent (§10.1). Every case in which a message reached the fake ends with an
+**Tests.** The fake SMTP server (`tests/fakesmtp.py`) lives inside the test process and can
+answer anything at any stage, or stay silent (§10.1). Two autouse guards in `conftest.py` fail
+any test that connects anywhere but loopback or writes outside the temporary directory
+(case 20). `docs/spec-coverage.md` maps every acceptance case to its tests; keep it current. Every case in which a message reached the fake ends with an
 assertion on the raw message, parsed independently with the standard library — not only on the
 HTTP response. **Every assertion must be able to fail**: break the behaviour a test describes
 and confirm it goes red.
 
 ## Release
 
-Rules from §12, in force from the first tag (`0.1.0`); the release workflow lands with the
-image:
+Rules from §12, in force from the first tag (`0.1.0`). The release workflow is not written
+yet; it comes before the first tag, modelled on mail-dissect's:
 
 - an **annotated** `v*` tag equal to `pyproject.version` (and `mail_dispatch.__version__`, which
   a test keeps in step);

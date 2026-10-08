@@ -1,0 +1,11 @@
+# Whitelist: everything is excluded, then the few things the images need are let back in.
+# Structural, not a list of things to remember - a .env or a stray artifact directory cannot
+# reach a layer even if someone forgets it exists.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!tests/
+**/__pycache__

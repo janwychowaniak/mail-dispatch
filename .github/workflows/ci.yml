@@ -20,3 +20,50 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy --strict src
       - run: uv run pytest -q --cov --cov-fail-under=90
+
+  # The suite again, inside the image's test stage: read-only, a tmpfs for the harness's
+  # certificates, and no network at all - the fake listens on loopback, so the missing network
+  # also proves the isolation [D46].
+  test-in-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      # DOCKER_BUILDKIT=0: the Dockerfile must stay buildable with the classic builder.
+      # Claiming it is not enough - CI checks.
+      - run: DOCKER_BUILDKIT=0 docker build --target test -t mail-dispatch:test .
+      - run: docker run --rm --read-only --tmpfs /tmp --network none mail-dispatch:test
+
+  # The release image on a standard runner, with no CPU emulation [D45], read-only and with
+  # no tmpfs at all: the service itself needs no writable path [D46].
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: DOCKER_BUILDKIT=0 docker build -t mail-dispatch:ci .
+      - name: The release image serves read-only and answers its contract
+        run: |
+          docker run -d --name md --read-only -p 127.0.0.1:8000:8000 \
+            -e SMTP_HOST=smtp.invalid -e HEALTH_PROBE_TIMEOUT_SECONDS=2 mail-dispatch:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/v1/health >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/v1/health | tee /tmp/health.json
+          python3 -c "import json; h = json.load(open('/tmp/health.json')); assert h['ok'] is False and h['upstream']['status'] == 'down', h"
+          # A wrong content type is refused before anything else, in the envelope (§3).
+          test "$(curl -s -o /tmp/send.json -w '%{http_code}' -X POST \
+            -H 'content-type: text/plain' --data 'x' http://127.0.0.1:8000/v1/send)" = "400"
+          python3 -c "import json; e = json.load(open('/tmp/send.json')); assert e['error']['code'] == 'INVALID_REQUEST', e"
+          docker logs md
+          docker rm -f md
+      # Credentials with SMTP_TLS=none: the password file is readable, the combination is not.
+      - name: A contradictory configuration stops startup [D26] [D28]
+        run: |
+          set +e
+          docker run --rm -e SMTP_HOST=smtp.example.org -e SMTP_TLS=none \
+            -e SMTP_USERNAME=user -e SMTP_PASSWORD_FILE=/etc/hostname mail-dispatch:ci
+          code=$?
+          set -e
+          test "$code" = "2"
