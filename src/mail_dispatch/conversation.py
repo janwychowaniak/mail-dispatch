@@ -15,7 +15,7 @@ import asyncio
 import base64
 import re
 import ssl
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -86,6 +86,26 @@ class Progress:
 def dot_stuff(data: bytes) -> bytes:
     """RFC 5321 §4.5.2: a line that starts with `.` gets a second one."""
     return _LINE_START_DOT.sub(b"..", data)
+
+
+def stuffed_chunks(data: bytes, end: int) -> Iterator[bytes]:
+    """`data[:end]`, dot-stuffed, in pieces of about 64 KiB that each begin a line.
+
+    Stuffing piece by piece keeps a second copy of the whole message out of memory.
+    """
+    start = 0
+    while start < end:
+        stop = min(start + _CHUNK, end)
+        if stop < end:
+            newline = data.rfind(b"\n", start, stop)
+            if newline < start:
+                # A line longer than a piece: the piece runs to the end of that line.
+                newline = data.find(b"\n", stop, end)
+                stop = end if newline < 0 else newline + 1
+            else:
+                stop = newline + 1
+        yield dot_stuff(data[start:stop])
+        start = stop
 
 
 def _fail(code: ErrorCode, stage: Stage, reply: Reply) -> UpstreamError:
@@ -230,11 +250,9 @@ class Conversation:
         if reply.code != 354:
             # After a 2xx to DATA the content is not sent: it would be read as commands.
             raise _by_class("data", reply, "UPSTREAM_REJECTED")
-        stuffed = dot_stuff(message)
         # The message ends in CRLF; that CRLF goes out with the terminating dot.
-        body = memoryview(stuffed)[:-2]
-        for start in range(0, len(body), _CHUNK):
-            await connection.write(bytes(body[start : start + _CHUNK]))
+        for chunk in stuffed_chunks(message, len(message) - 2):
+            await connection.write(chunk)
         await self._final_write(connection)
 
         reply = await connection.read_reply()

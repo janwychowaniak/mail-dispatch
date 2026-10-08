@@ -18,7 +18,13 @@ from datetime import UTC, datetime
 from email.utils import format_datetime
 
 from . import filetypes
-from .bodies import TransferEncoding, encode, normalise_line_endings, text_encoding
+from .bodies import (
+    TransferEncoding,
+    base64_pieces,
+    encode_pieces,
+    quoted_printable_pieces,
+    text_encoding,
+)
 from .headers import (
     address_list,
     filename_parameters,
@@ -75,8 +81,7 @@ def _header_bytes(headers: Sequence[Header]) -> bytes:
     return b"".join(out)
 
 
-def _text_part(content: str, subtype: str) -> _Leaf:
-    data = normalise_line_endings(content)
+def _text_part(data: bytes, subtype: str) -> _Leaf:
     encoding = text_encoding(data)
     return _Leaf(
         [
@@ -145,25 +150,27 @@ def _structure(request: MessageRequest) -> _Entity:
 
 def _serialise(
     entity: _Entity, boundary: Callable[[], str], *, top: bool
-) -> tuple[list[Header], bytes]:
-    """The entity's own `Content-*` headers and its body.
+) -> tuple[list[Header], list[bytes]]:
+    """The entity's own `Content-*` headers and its body, as pieces joined once at the end.
 
-    A body inside a multipart is followed by `CRLF` and a delimiter, which belong to the
-    delimiter; the top-level body ends the message, so it is terminated itself.
+    Every body ends in `CRLF`: at the top it ends the message, inside a multipart it is the
+    `CRLF` that belongs to the next delimiter. Base64 lines already end in one, so the encoded
+    body is used as it is rather than copied to add or remove one.
     """
     if isinstance(entity, _Leaf):
-        return entity.headers, encode(entity.content, entity.encoding, terminated=top)
-    marker = boundary()
+        if top:
+            return entity.headers, encode_pieces(entity.content, entity.encoding, terminated=True)
+        if entity.encoding == "base64":
+            return entity.headers, base64_pieces(entity.content, terminated=True) or [b"\r\n"]
+        return entity.headers, [*quoted_printable_pieces(entity.content), b"\r\n"]
+    marker = boundary().encode("ascii")
     chunks: list[bytes] = []
     for child in entity.children:
         headers, body = _serialise(child, boundary, top=False)
-        chunks.append(b"--" + marker.encode("ascii") + b"\r\n")
-        chunks.append(_header_bytes(headers) + b"\r\n" + body + b"\r\n")
-    chunks.append(b"--" + marker.encode("ascii") + b"--")
-    if top:
-        chunks.append(b"\r\n")
-    params = (f'boundary="{marker}"', *entity.extra)
-    return [("Content-Type", parameters(f"multipart/{entity.subtype}", params))], b"".join(chunks)
+        chunks += [b"--" + marker + b"\r\n", _header_bytes(headers), b"\r\n", *body]
+    chunks.append(b"--" + marker + b"--\r\n")
+    params = (f'boundary="{marker.decode("ascii")}"', *entity.extra)
+    return [("Content-Type", parameters(f"multipart/{entity.subtype}", params))], chunks
 
 
 def _mailboxes(header: str, boxes: Sequence[Mailbox]) -> Header:
@@ -196,5 +203,5 @@ def compose(
     headers.extend((name, split_at_white_space(" " + value)) for name, value in request.headers)
 
     content_headers, body = _serialise(_structure(request), boundary, top=True)
-    data = _header_bytes([*headers, *content_headers]) + b"\r\n" + body
+    data = b"".join([_header_bytes([*headers, *content_headers]), b"\r\n", *body])
     return Composed(data, message_id)

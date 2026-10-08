@@ -223,3 +223,22 @@ def test_long_filenames_use_continuations_within_78(filename: str) -> None:
     assert len(sections) > 1
     assert all(len(" " + section + ";") <= 78 for section in sections)
     assert all(re.match(r"filename\*\d+\*?=", section) for section in sections)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_stuffing_piece_by_piece_equals_stuffing_the_whole(seed: int) -> None:
+    from mail_dispatch.conversation import dot_stuff, stuffed_chunks
+
+    rng = random.Random(seed)
+    lines = [
+        rng.choice([b".", b"..", b"", b"x", b".x"]) + b"y" * rng.choice([0, 10, 80, 900])
+        for _ in range(rng.randint(1, 600))
+    ]
+    # One line longer than a piece, somewhere.
+    lines.insert(rng.randint(0, len(lines)), b"." + b"z" * 70_000)
+    data = b"\r\n".join(lines) + b"\r\n"
+    end = len(data) - 2
+    pieces = list(stuffed_chunks(data, end))
+    assert b"".join(pieces) == dot_stuff(data[:end])
+    # Every piece ends a line, so the next one begins one and `^` sees real line starts.
+    assert all(piece.endswith(b"\n") for piece in pieces[:-1])

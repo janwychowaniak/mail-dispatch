@@ -103,6 +103,7 @@ def parse_json(body: bytes) -> Any:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         raise ApiError("INVALID_REQUEST", "the body is not valid UTF-8") from None
+    del body
     try:
         return json.loads(
             text, object_pairs_hook=_object_without_repeats, parse_constant=_reject_constant

@@ -30,7 +30,7 @@ from .health import Health
 from .intake import check_content_type, parse_json, read_body
 from .jsonlog import log_event
 from .settings import Settings
-from .smtp import Resolver, UpstreamError
+from .smtp import Reply, Resolver, UpstreamError
 from .validation import MessageRequest, validate
 
 _UPSTREAM_MESSAGES = {
@@ -46,8 +46,25 @@ _INTERNAL_UPSTREAM_MESSAGE = "the service failed during the conversation"
 
 
 @dataclass(frozen=True, slots=True)
+class Envelope:
+    """What the conversation and the log need of a request, once it is composed."""
+
+    sender: str
+    recipients: tuple[tuple[str, str], ...]
+    domains: tuple[str, ...]
+
+    @classmethod
+    def of(cls, message: MessageRequest) -> Envelope:
+        return cls(
+            sender=message.sender.address,
+            recipients=tuple((r.mailbox.address, r.field) for r in message.recipients),
+            domains=tuple(sorted({r.mailbox.domain.lower() for r in message.recipients})),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Prepared:
-    message: MessageRequest
+    envelope: Envelope
     composed: Composed
 
 
@@ -56,15 +73,25 @@ class Reached:
     """What one send has reached so far, for whichever way it ends."""
 
     progress: Progress
-    message: MessageRequest | None = None
+    envelope: Envelope | None = None
     composed: Composed | None = None
     log: dict[str, object] = field(default_factory=dict)
 
 
-def prepare(body: bytes, settings: Settings, server_size: int | None) -> Prepared:
-    """Steps 2-6 of §4.7: parse, validate, compose, and check the composed size [D19]."""
-    message = validate(parse_json(body), max_recipients=settings.max_recipients)
+def prepare(body: list[bytes], settings: Settings, server_size: int | None) -> Prepared:
+    """Steps 2-6 of §4.7: parse, validate, compose, and check the composed size [D19].
+
+    Each form of the request is let go as soon as the next one exists - the body once it is
+    parsed, the document once it is validated, the decoded parts once the message is composed
+    - so a send in progress holds as little as it can (§7.3) [D48]. The body comes in a list
+    that this function empties, so that the caller holds no reference to it.
+    """
+    document = parse_json(body.pop())
+    message = validate(document, max_recipients=settings.max_recipients)
+    del document
     composed = compose(message, message_id_domain=settings.message_id_domain)
+    envelope = Envelope.of(message)
+    del message
     size = len(composed.data)
     limit, source = settings.max_message_bytes, "max_message_bytes"
     if server_size is not None and server_size < limit:
@@ -77,7 +104,7 @@ def prepare(body: bytes, settings: Settings, server_size: int | None) -> Prepare
             actual_bytes=size,
             limit_source=source,
         )
-    return Prepared(message, composed)
+    return Prepared(envelope, composed)
 
 
 async def _disconnected(receive: Callable[[], Awaitable[Any]]) -> None:
@@ -109,12 +136,12 @@ class SendHandler:
         watcher: asyncio.Task[None] | None = None
         try:
             check_content_type(request)
-            body = await read_body(request, self.settings.max_request_bytes)
+            body = [await read_body(request, self.settings.max_request_bytes)]
             watcher = asyncio.create_task(_disconnected(request.receive))
             prepared = await asyncio.to_thread(
                 prepare, body, self.settings, self.health.fresh_size_limit()
             )
-            reached.message, reached.composed = prepared.message, prepared.composed
+            reached.envelope, reached.composed = prepared.envelope, prepared.composed
             return await self._send(dispatch_id, reached, watcher)
         except ApiError as error:
             return self._error(dispatch_id, reached, error)
@@ -129,18 +156,15 @@ class SendHandler:
     async def _send(
         self, dispatch_id: str, reached: Reached, watcher: asyncio.Task[None]
     ) -> Response:
-        message, composed = reached.message, reached.composed
-        assert message is not None and composed is not None
+        envelope, composed = reached.envelope, reached.composed
+        assert envelope is not None and composed is not None
         if watcher.done():
             # Gone before the connection is opened: none is opened (§5.6).
             return self._aborted(dispatch_id, reached)
         conversation = Conversation(self.settings, self.context, self.resolver, reached.progress)
         talking = asyncio.create_task(
             conversation.run(
-                composed.data,
-                len(composed.data),
-                message.sender.address,
-                [(r.mailbox.address, r.field) for r in message.recipients],
+                composed.data, len(composed.data), envelope.sender, envelope.recipients
             )
         )
         await asyncio.wait({talking, watcher}, return_when=asyncio.FIRST_COMPLETED)
@@ -158,8 +182,8 @@ class SendHandler:
         return self._success(dispatch_id, reached)
 
     def _success(self, dispatch_id: str, reached: Reached) -> Response:
-        message, composed, progress = reached.message, reached.composed, reached.progress
-        assert message is not None and composed is not None
+        composed, progress = reached.composed, reached.progress
+        assert composed is not None
         counts = {
             status: sum(1 for r in progress.recipients if r.status == status)
             for status in ("accepted", "rejected", "deferred")
@@ -196,7 +220,8 @@ class SendHandler:
         return fields
 
     def _upstream_error(self, reached: Reached, error: UpstreamError) -> ApiError:
-        reached.log["reply"] = _reply_log(error)
+        if error.reply is not None:
+            reached.log["reply"] = _code_log(error.reply)
         return ApiError(
             error.code,
             _UPSTREAM_MESSAGES[error.code],
@@ -244,13 +269,11 @@ class SendHandler:
         """One event per request: identifiers, sizes, stage, codes, counters — never the text
         of a reply, the subject, the content or the full recipient list [D30]."""
         fields: dict[str, object] = {"dispatch_id": dispatch_id, "status": status, "result": result}
-        message, progress = reached.message, reached.progress
-        if message is not None:
-            fields["sender"] = message.sender.address
-            fields["recipients"] = len(message.recipients)
-            fields["recipient_domains"] = sorted(
-                {r.mailbox.domain.lower() for r in message.recipients}
-            )
+        envelope, progress = reached.envelope, reached.progress
+        if envelope is not None:
+            fields["sender"] = envelope.sender
+            fields["recipients"] = len(envelope.recipients)
+            fields["recipient_domains"] = list(envelope.domains)
         if reached.composed is not None:
             fields["size_bytes"] = len(reached.composed.data)
         if progress.stage is not None:
@@ -267,12 +290,8 @@ class SendHandler:
         log_event("send", level=level, **fields)
 
 
-def _code_log(reply: Any) -> dict[str, object]:
+def _code_log(reply: Reply) -> dict[str, object]:
     entry: dict[str, object] = {"code": reply.code}
     if reply.enhanced is not None:
         entry["enhanced"] = reply.enhanced
     return entry
-
-
-def _reply_log(error: UpstreamError) -> dict[str, object] | None:
-    return None if error.reply is None else _code_log(error.reply)

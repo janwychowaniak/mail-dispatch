@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .addresses import envelope_key, split_addr_spec
+from .bodies import normalise_line_endings
 from .errors import ApiError, ErrorCode
 from .headers import fold, parameters, split_at_white_space
 
@@ -161,8 +162,9 @@ class MessageRequest:
     recipients: tuple[Recipient, ...]
     reply_to: tuple[Mailbox, ...]
     subject: str
-    text: str | None
-    html: str | None
+    # The content as it is sent: UTF-8 with every line ending CRLF (§4.3) [D8].
+    text: bytes | None
+    html: bytes | None
     inline: tuple[Inline, ...]
     attachments: tuple[Attachment, ...]
     headers: tuple[tuple[str, str], ...]
@@ -393,8 +395,14 @@ def _filename(raw: str, path: str, index: int) -> str:
     return raw
 
 
+def _content(raw: str | None) -> bytes | None:
+    return None if raw is None else normalise_line_endings(raw)
+
+
 def _base64(raw: str, path: str, index: int) -> bytes:
-    cleaned = raw.translate(_BASE64_IGNORED)
+    # A copy only when there is something to remove.
+    needs_cleaning = "\n" in raw or "\r" in raw or " " in raw
+    cleaned = raw.translate(_BASE64_IGNORED) if needs_cleaning else raw
     if len(cleaned) % 4 or not _BASE64.fullmatch(cleaned):
         raise _error("INVALID_CONTENT", "is not valid padded base64", path, index)
     return binascii.a2b_base64(cleaned)
@@ -468,8 +476,8 @@ def validate(document: object, *, max_recipients: int) -> MessageRequest:
         recipients=recipients,
         reply_to=tuple(lists["reply_to"]),
         subject=shape["subject"],
-        text=_str(shape, "text"),
-        html=_str(shape, "html"),
+        text=_content(_str(shape, "text")),
+        html=_content(_str(shape, "html")),
         inline=inline,
         attachments=attachments,
         headers=headers,

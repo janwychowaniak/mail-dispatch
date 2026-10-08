@@ -34,7 +34,7 @@ def test_the_baseline_is_valid() -> None:
     assert message.sender.address == "sender@example.org"
     assert message.sender.name == "Sender"
     assert [(r.mailbox.address, r.field) for r in message.recipients] == [("to@example.org", "to")]
-    assert message.text == "Hello, world."
+    assert message.text == b"Hello, world."
     assert message.html is None
 
 
@@ -128,7 +128,7 @@ def test_neither_text_nor_html(document: dict[str, Any]) -> None:
 def test_inline_without_html() -> None:
     inline = [{"cid": "a", "content_type": "image/png", "content_base64": ""}]
     assert where(fails(request(inline=inline))) == ("INVALID_REQUEST", "inline", None)
-    assert ok(request(inline=inline, html="")).html == ""
+    assert ok(request(inline=inline, html="")).html == b""
 
 
 def test_cross_field_rules_come_after_the_walk_in_order() -> None:
@@ -152,7 +152,7 @@ def test_absent_null_and_empty_mean_none() -> None:
 
 def test_empty_strings_are_present() -> None:
     message = ok(request(subject="", text="", html=""))
-    assert (message.subject, message.text, message.html) == ("", "", "")
+    assert (message.subject, message.text, message.html) == ("", b"", b"")
 
 
 # Step 3: control characters ------------------------------------------------------------------
@@ -212,7 +212,7 @@ def test_control_characters_come_before_grammars() -> None:
 
 
 def test_control_characters_are_allowed_in_content() -> None:
-    assert ok(request(text="a\tb\x00c\x1b", html="\x7f")).text == "a\tb\x00c\x1b"
+    assert ok(request(text="a\tb\x00c\x1b", html="\x7f")).text == b"a\tb\x00c\x1b"
 
 
 @pytest.mark.parametrize(
