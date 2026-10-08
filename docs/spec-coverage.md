@@ -42,3 +42,5 @@ Beyond the numbered cases:
 | §7 configuration and startup validation [D28] | `test_settings.py`; `test_logging.py::test_invalid_configuration_stops_startup`; the `image` CI job |
 | §9 logging [D30] | `test_logging.py`; `test_send.py::test_logs_carry_no_text_and_no_content`; `test_transport.py::test_case_17_wrong_password` |
 | §3 content type, paths and methods | `test_envelope.py` |
+| §4.7 which error wins [D36] | `test_validation.py::test_unknown_keys_come_before_missing_ones`, `::test_depth_first_in_schema_order`, `::test_cross_field_rules_come_after_the_walk_in_order`, `::test_control_characters_come_before_grammars`, `::test_addresses_come_before_duplicates`, `::test_custom_headers_come_before_parts`, `::test_parts_in_schema_order`, `::test_a_part_header_too_long_is_checked_with_its_part`, `::test_a_part_header_too_long_keeps_its_place_in_the_schema_order` |
+| §5.2 replies outside the expected course and other protocol violations [D39] | `test_transport.py::test_auth_login_out_of_course`, `::test_auth_plain_answered_with_334`, `::test_a_reply_that_is_not_smtp`, `::test_data_before_the_tls_handshake_is_refused`, `::test_starttls_answered_out_of_course` |

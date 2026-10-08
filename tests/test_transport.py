@@ -424,6 +424,19 @@ def test_auth_login_out_of_course(
     assert error["upstream"]["stage"] == "auth"
 
 
+def test_auth_plain_answered_with_334(
+    service: ServiceFactory, secured: FakeSMTP, certificates: Certificates
+) -> None:
+    """[D39]: `AUTH PLAIN` carries its initial response, so a challenge is out of course and
+    nothing more is sent."""
+    secured.auth = ["PLAIN"]
+    secured.responses["AUTH"] = "334 VXNlcm5hbWU6"
+    error = upstream_error(service, "UPSTREAM_ERROR", **credentials(certificates))
+    assert error["upstream"] == {"stage": "auth", "code": 334, "message": "VXNlcm5hbWU6"}
+    assert sum(1 for c in secured.last.commands if c.startswith("AUTH")) == 1
+    assert not any(c.startswith("MAIL") for c in secured.last.commands)
+
+
 def test_case_17_credentials_never_travel_without_tls(
     service: ServiceFactory, fake: FakeSMTP
 ) -> None:

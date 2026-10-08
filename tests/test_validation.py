@@ -611,6 +611,41 @@ def test_parts_in_schema_order() -> None:
     assert where(fails(document)) == ("INVALID_CONTENT", "inline[0].content_type", 0)
 
 
+@pytest.mark.parametrize(
+    ("parts", "field"),
+    [
+        ({"inline": [inline(cid="x" * 1000)]}, "inline[0].cid"),
+        (
+            {"inline": [inline(content_type="image/png; a=" + "x" * 1000)]},
+            "inline[0].content_type",
+        ),
+        (
+            {"attachments": [attachment(content_type="text/plain; a=" + "x" * 1000)]},
+            "attachments[0].content_type",
+        ),
+    ],
+)
+def test_a_part_header_too_long_is_checked_with_its_part(parts: dict[str, Any], field: str) -> None:
+    """[D36]: a check belongs to the category of the field it examines, not of the code it
+    returns, so an unfoldable `cid` or `content_type` parameter loses to a bad custom header."""
+    assert where(fails(request(html="", **parts)))[:2] == ("INVALID_HEADER", field)
+    both = request(html="", headers={"Bcc": "x"}, **parts)
+    assert where(fails(both)) == ("INVALID_HEADER", "headers.Bcc", None)
+
+
+def test_a_part_header_too_long_keeps_its_place_in_the_schema_order() -> None:
+    """[D36]: within the parts it is checked at the field's place, so it wins over a later field
+    of its part and loses to an earlier part."""
+    long_cid = inline(cid="x" * 1000, content_base64="!")
+    assert where(fails(request(html="", inline=[long_cid]))) == (
+        "INVALID_HEADER",
+        "inline[0].cid",
+        0,
+    )
+    earlier = request(html="", inline=[inline(content_base64="!"), inline(cid="y" * 1000)])
+    assert where(fails(earlier)) == ("INVALID_CONTENT", "inline[0].content_base64", 0)
+
+
 # Names [D35] -------------------------------------------------------------------------------
 
 

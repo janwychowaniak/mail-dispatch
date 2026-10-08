@@ -314,6 +314,12 @@ the first failing field in this order is reported:
    `content_base64`;
 4. `headers{}`, in request order.
 
+A check belongs to the category of the field it examines, not of the code it returns: the length
+rules of §4.5 for a `cid` and for a `content_type` parameter are applied with their part, in the
+bodies-and-parts category of step 4, at the field's place in the schema order — and still yield
+`INVALID_HEADER`. So a request with both an invalid `headers{}` entry and an unfoldable `cid`
+reports the `headers{}` entry.
+
 Step 2 follows the same order, depth first. A byte-order mark, invalid JSON and a repeated key are
 found while parsing, before anything else. Then, for every object, starting with the top level:
 
@@ -378,8 +384,11 @@ The limit envelopes carry the threshold, the measured value and the source of th
 - Multi-line server replies are joined with `\n` without the codes, and decoded from UTF-8 with
   invalid bytes replaced; the code of a multi-line reply is taken from its last line.
 - **A reply outside the expected course** — 3xx to `MAIL FROM` or `RCPT TO`, 2xx to `DATA`
-  instead of 354, a 1xx, and a 2xx or a 3xx other than 334 in the middle of `AUTH LOGIN` — is
-  `UPSTREAM_ERROR` at the current stage. A 4xx or 5xx at **any** step of `AUTH`, between the steps
+  instead of 354, a 1xx, a 3xx (334 included) to `AUTH PLAIN` sent with its initial response, and
+  a 2xx or a 3xx other than 334 in the middle of `AUTH LOGIN` — is `UPSTREAM_ERROR` at the current
+  stage. So are the other protocol violations of §5.5, for example data the server sends after its
+  reply to `STARTTLS` and before the TLS handshake (it would be read as if it had come under TLS),
+  and a reply line longer than 64 KiB. A 4xx or 5xx at **any** step of `AUTH`, between the steps
   of `LOGIN` included, keeps its meaning from the table of §5.5 (`UPSTREAM_TRANSIENT`,
   `UPSTREAM_AUTH`). After a 2xx to `DATA` the content **is not sent** (the server would read it as
   commands). A 3xx to `RCPT TO` fits none of `accepted`/`rejected`/`deferred`, so it ends the
@@ -1011,7 +1020,9 @@ The README says explicitly, among the rest:
   U+0020 for the ASCII values of custom headers — named by the property, so that it does not depend
   on what a language's `isspace` happens to include.
 - **[D36] The first error in a fixed schema order wins**, and the same order gives `field` and
-  `index`: the same invalid request always gets the same error.
+  `index`: the same invalid request always gets the same error. A check belongs to the category of
+  the field it examines, not of the code it returns, so the length of a `cid` or a `content_type`
+  parameter is checked with its part and still gives `INVALID_HEADER`.
 - **[D37] The health probe has one deadline for all of it**, and `timeout` means exactly that the
   deadline passed before the measurement ended; the idle limit of a send does not apply. The
   measurement ends with the reply to the last `EHLO`; the age counts from there, and `QUIT` lies
@@ -1024,6 +1035,8 @@ The README says explicitly, among the rest:
   `RCPT TO` ends the send, since it fits none of the recipient statuses. In `AUTH LOGIN` only a 2xx
   or a 3xx other than 334 is out of course; a 4xx or 5xx at any step keeps the meaning of the
   table, so a `535` after the user name is `UPSTREAM_AUTH`, exactly like one after the password.
+  `AUTH PLAIN` carries its initial response, so any 3xx to it is out of course. Data sent before
+  the TLS handshake and a reply line over 64 KiB are protocol violations with the same outcome.
 - **[D40] `SMTP_EHLO_NAME` is an RFC 5321 `Domain`, and the all-digits rule for the last label of
   an address domain does not apply to it.** A default container hostname is all digits about once in
   300 starts, and the image must not fail to start at random. `MESSAGE_ID_DOMAIN` keeps the address
