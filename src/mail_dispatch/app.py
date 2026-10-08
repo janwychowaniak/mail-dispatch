@@ -16,15 +16,23 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
+from .dispatch import SendHandler
 from .errors import ApiError, error_response, new_dispatch_id
-from .intake import check_content_type, parse_json, read_body
+from .health import Health
 from .jsonlog import log_event
 from .settings import Settings
+from .smtp import Resolver, system_resolver, tls_context
 
 Clock = Callable[[], float]
 
 
-def create_app(settings: Settings, *, clock: Clock = time.monotonic) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    clock: Clock = time.monotonic,
+    resolver: Resolver = system_resolver,
+) -> FastAPI:
+    """The application; tests substitute the clock and name resolution (§10.1)."""
     app = FastAPI(
         title="mail-dispatch",
         version=__version__,
@@ -34,35 +42,22 @@ def create_app(settings: Settings, *, clock: Clock = time.monotonic) -> FastAPI:
         # `/v1/send/` is NOT_FOUND, not a redirect (§3).
         redirect_slashes=False,
     )
-    app.state.settings = settings
-    app.state.clock = clock
-    app.state.started = clock()
+    context = tls_context(settings)
+    health = Health(settings, context, resolver, clock)
+    send = SendHandler(settings, context, resolver, health, time.monotonic)
 
+    async def health_endpoint() -> Response:
+        body = await health.body()
+        log_event("health", status=200, upstream_status=body["upstream"]["status"])  # type: ignore[index]
+        return JSONResponse(body)
+
+    app.state.settings = settings
+    app.state.health = health
     app.add_exception_handler(StarletteHTTPException, _routing_error)
     app.add_middleware(EnvelopeGuard)
     app.add_api_route("/v1/send", send, methods=["POST"])
-    app.add_api_route("/v1/health", health, methods=["GET"])
+    app.add_api_route("/v1/health", health_endpoint, methods=["GET"])
     return app
-
-
-async def send(request: Request) -> Response:
-    settings: Settings = request.app.state.settings
-    dispatch_id = new_dispatch_id()
-    try:
-        check_content_type(request)
-        body = await read_body(request, settings.max_request_bytes)
-        parse_json(body)
-        raise NotImplementedError("validation, composition and the conversation")
-    except ApiError as error:
-        _log_request(request, dispatch_id, error.status, error.code)
-        return error_response(dispatch_id, error)
-    except Exception as exc:
-        _log_request(request, dispatch_id, 500, "INTERNAL_ERROR", exception=exc)
-        return error_response(dispatch_id, _internal_error())
-
-
-async def health(request: Request) -> Response:
-    raise NotImplementedError("the health probe")
 
 
 async def _routing_error(request: Request, exc: Exception) -> Response:

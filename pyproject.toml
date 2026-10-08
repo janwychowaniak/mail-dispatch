@@ -24,6 +24,7 @@ dev = [
     "mypy>=1.13",
     "ruff>=0.8",
     "httpx2>=2.13",
+    "cryptography>=44",
 ]
 
 [build-system]
